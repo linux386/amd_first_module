@@ -1,0 +1,4 @@
+[{"market":"KRW-BTC","candle_date_time_utc":"2021-04-06T04:12:00","candle_date_time_kst":"2021-04-06T13:12:00","opening_price":78520000.00000000,"high_price":78527000.00000000,"low_price":78503000.00000000,"trade_price":78520000.00000000,"timestamp":1617682340890,"candle_acc_trade_price":78831876.51658000,"candle_acc_trade_volume":1.00398742,"unit":1}]
+--------------------
+-- Type =>  <class 'str'>
+--------------------
