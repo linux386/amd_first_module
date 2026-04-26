@@ -1,0 +1,904 @@
+# -*- coding: utf-8 -*-
+"""
+Spyder Editor
+This is a temporary script file.
+"""
+
+# 필요한 모듈 임포트
+import json
+import time
+import re
+import os
+import glob
+import shutil
+import io
+import sys
+import datetime as dt
+from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+from bs4 import BeautifulSoup
+import sqlalchemy
+import pymysql
+from urllib.request import urlopen
+import urllib.request as req
+
+# PlaidML 백엔드 설정
+import plaidml.keras
+plaidml.keras.install_backend()
+
+# Plotly 및 Matplotlib 설정
+import plotly.offline as offline
+import plotly.graph_objs as go
+from matplotlib import font_manager, rc
+from matplotlib import pyplot as plt
+plt.rcParams.update({'figure.max_open_warning': 0})
+plt.rcParams['axes.unicode_minus'] = False
+plt.rc('axes', unicode_minus=False)
+font_name = font_manager.FontProperties(fname="c:/Windows/Fonts/malgun.ttf").get_name()
+rc('font', family=font_name)
+
+# Keras 및 기타 ML 라이브러리
+from keras.models import Sequential
+from keras.layers import Dense, Activation, Dropout, LSTM
+from sklearn.preprocessing import MinMaxScaler
+import mplfinance as mpf
+import talib.abstract as ta
+from talib import RSI, BBANDS
+
+# 경고 관리
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning) 
+
+# 날짜 관련 변수 설정
+today = datetime.now()
+str_yesterday = (today - timedelta(1)).strftime('%Y-%m-%d')
+str_today = today.strftime('%Y-%m-%d')
+three_period = ['day', 'week', 'month']
+
+# MySQL 데이터베이스 연결 설정
+host = "localhost"
+port = 3306
+user = "root"
+password = "your_password"  # 이 부분은 환경 변수 또는 설정 파일로 대체하는 것을 권장합니다.
+database = "stock"
+
+# MySQL 데이터베이스 연결
+connection = pymysql.connect(host=host, port=port, user=user, password=password, database=database)
+
+# SQLAlchemy 엔진 설정
+engine = sqlalchemy.create_engine(f'mysql+pymysql://{user}:{password}@{host}/{database}?charset=utf8', encoding='utf-8')
+conn = pymysql.connect(host=host, port=port, user=user, password=password, database=database)
+curs = conn.cursor()
+
+# 삼성전자 마지막 날짜 조회
+stock_last_day = pd.read_sql("SELECT Date FROM market WHERE Name='삼성전자' ORDER BY Date DESC LIMIT 1", engine)
+stock_last_day['Date'] = pd.to_datetime(stock_last_day['Date']).dt.strftime('%Y-%m-%d')
+stock_last_day = stock_last_day['Date'].to_list()[0]
+
+# 파일 경로 설정
+path_test = 'C:/Users/linux/OneDrive/stockdata/test_data/'
+path_down = 'C:/Users/linux/OneDrive/stockdata/period_down/'
+path_depress = 'C:/Users/linux/OneDrive/stockdata/depress/'
+path_depress_d = 'C:/Users/linux/OneDrive/stockdata/depress/depress_day_'
+path_depress_w = 'C:/Users/linux/OneDrive/stockdata/depress/depress_week_'
+path_depress_m = 'C:/Users/linux/OneDrive/stockdata/depress/depress_month_'
+path_vote_stock = 'C:/Users/linux/OneDrive/stockdata/vote_stock/'
+path_price = 'C:/Users/linux/OneDrive/stockdata/vote_stock/detect_stock_with_price_'
+path_volume = 'C:/Users/linux/OneDrive/stockdata/vote_stock/detect_stock_with_volume_'
+path_close_2008 = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_close_2008-01-01_'
+path_close_2019 = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_close_2019-01-01_'
+path_ma_2008 = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_ma_2008-01-01_'
+path_ma_2019 = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_ma_2019-01-01_'
+path_ma = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_ma_'
+path_close = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_close_'
+path_close_ma120 = 'C:/Users/linux/OneDrive/stockdata/close_ma120/'
+
+# 코스피 마지막 날짜 조회 및 처리
+kospi_final_day_df = pd.read_sql("SELECT Date FROM kospi ORDER BY Date DESC LIMIT 1", engine)
+final_day = kospi_final_day_df
+kospi_final_day_df = pd.to_datetime(kospi_final_day_df['Date'])
+kospi_next_day = kospi_final_day_df + timedelta(1)
+kospi_next_day_str = str(kospi_next_day)[4:14].replace('-', '')
+
+def compare_graph(path_name, day, from_day, subject, count=5):
+    name = pd.read_excel(path_name+day+'.xlsx')
+    name.columns = map(str.lower, name.columns)
+    name = name['name']
+    print('all:', name.shape[0])
+    name = name.iloc[count:count+5]
+    name = name.to_list()
+    
+    df1 = pd.DataFrame()
+
+    for x in  name:
+        df = select_stock(x, from_day)
+        df = df[['Date',subject]]
+        df.columns=['Date',x]
+        
+        if df1.empty:
+            df1 = df
+        elif df.empty:  ##  종목이 상장폐지되어 없어진것은 merge하지 않는다
+            pass
+        else:
+            df1 = pd.merge (df,df1,on='Date')
+    df1=df1.set_index('Date')
+    df1 = df1[df1.columns[::-1]]  ##  그래프 생성시 legend를 순서대로 나오게하기위해  columns를  재구성
+    name=df1.columns.tolist() ##  df에서  상장폐지되어 df1에 없어진 columnes를 수정하여 현행화한 name list
+    
+    plt.figure(figsize=(12,5))
+    for i in range(len(name)):
+        plt.plot(df1[name[i]]/df1[name[i]].iloc[0]*100)
+        plt.legend(name,loc=0)
+        plt.grid(True,color='0.7',linestyle=':',linewidth=2)
+
+def kospi_kosdaq(lastday='20251231', market='1001'):
+    if market == '1001':
+        df = get_index_ohlcv_by_date(kospi_next_day_no_hypyen, lastday, market)
+        df.index.names = ['Date']
+        df = df.iloc[:,[0,1,2,3,4]]
+        df.columns  = ['Open','High','Low','Close','Volume']
+        df['Market']='kospi'
+        df.to_sql(name='kospi', con=engine, if_exists='append')
+    elif market == '2001':
+        df = get_index_ohlcv_by_date(kospi_next_day_no_hypyen, lastday, market)
+        df.index.names = ['Date']
+        df = df.iloc[:,[0,1,2,3,4]]
+        df.columns  = ['Open','High','Low','Close','Volume']        
+        df['Market']='kosdaq'
+        df.to_sql(name='kosdaq', con=engine, if_exists='append')
+
+def compare_graph_with_name(name):
+    select_query = "select Date,Close,Volume from market where Name= "
+    date_query =  "Date >"
+    df_Close = pd.DataFrame()
+    df_Volume = pd.DataFrame()
+    dfc = pd.DataFrame()
+    dfv = pd.DataFrame()
+    #name=['엘아이에스']
+    date = '2020-01-01'
+
+    for x in name:
+        var = select_query +"'"+x+"'"+" "+"&&"+" "+date_query+"'"+date+"'"
+        df = pd.read_sql(var ,engine)
+        df_Close = df[['Date', 'Close']]
+        df_Close.columns=['Date',x]
+        df_Close = df_Close.set_index('Date')
+        dfc = pd.concat([dfc,df_Close], axis=1)
+        df_Volume = df[['Date', 'Volume']]
+        df_Volume.columns=['Date',x]
+        df_Volume = df_Volume.set_index('Date')
+        dfv = pd.concat([dfv,df_Volume], axis=1)
+
+    plt.figure(figsize=(16,5))
+
+    for i in range(len(name)):
+        plt.plot(dfc[name[i]]/dfc[name[i]].loc[df['Date'][0]]*100)
+        #plt.plot(dfv[name[i]]/dfv[name[i]].loc[df['Date'][0]]*100)        
+    plt.legend(name,loc=0)
+    plt.grid(True,color='0.7',linestyle=':',linewidth=1)
+    plt.figure(figsize=(16,5))
+    for i in range(len(name)):
+        #plt.plot(dfc[name[i]]/dfc[name[i]].loc[df['Date'][0]]*100)
+        plt.plot(dfv[name[i]]/dfv[name[i]].loc[df['Date'][0]]*100)        
+    plt.legend(name,loc=0)
+    plt.grid(True,color='0.7',linestyle=':',linewidth=1)
+
+def day_week_month_data(market='kospi', from_day='2020-01-01', to_day=str_today, period='month'):
+    """
+    주어진 시장의 데이터를 일/주/월 단위로 처리합니다.
+    """
+    if market=='kospi' or market=='kosdaq':
+        df = select_market_period(market, from_day)
+    else:
+        df = select_stock(market,from_day,to_day)
+
+	# 날짜 데이터 그룹화 및 처리
+	df['Date'] = pd.to_datetime(df['Date'])
+	months = [g for _, g in df.groupby(pd.Grouper(key='Date', freq='M'))]
+	weeks = [g for _, g in df.groupby(pd.Grouper(key='Date', freq='W'))]
+	columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+	rows = []
+
+	# 월별, 주별, 일별 데이터 처리
+    if period == 'day':
+        nick = 'day'
+        df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+        df.columns = columns
+        #df = df.set_index(df['date'])
+        # return df
+    if period == 'month':
+        nick = 'month'
+        period = months
+    elif period == 'week':
+        nick = 'week'
+        period = weeks
+		
+	# 데이터 처리 루프
+	for i in range(len(period)):
+        try:
+            rows.append(period[i].iloc[-1]['Date'])
+            rows.append(period[i].iloc[0]["Open"])
+            rows.append(max(period[i]['High']))
+            rows.append(min(period[i]['Low']))
+            rows.append(period[i].iloc[-1]['Close'])
+            rows.append(sum(period[i]['Volume']))
+    except Exception as e:
+        print(f"Error processing data: {e}")
+
+    arr = np.array(rows)
+
+	# 데이터 반환 조건
+	if nick == 'day':
+		return df
+
+	# 배열 재구성
+	if nick == 'week' and len(period) > 177:
+		arr1 = arr.reshape(len(period) - 1, 6)
+	else:
+		arr1 = arr.reshape(len(period), 6)
+
+	# 데이터프레임 생성
+	df = pd.DataFrame(data=arr1, columns=columns)
+
+	# 최종 데이터프레임 반환
+	return df
+
+def depress(period='day', to_day=str_today):
+    """
+    특정 기간에 대한 데이터 처리를 수행하는 함수.
+    """
+    path_depress = 'C:/Users/linux/OneDrive/stockdata/depress/depress_'
+    time_to_day = pd.to_datetime(to_day)
+    
+    # 기간에 따른 from_day 설정
+    if period == 'day':
+        from_day = (time_to_day - timedelta(days=60)).strftime('%Y-%m-%d')
+    elif period == 'week':
+        from_day = (time_to_day - timedelta(days=180)).strftime('%Y-%m-%d')
+    elif period == 'month':
+        from_day = (time_to_day - timedelta(days=365*2)).strftime('%Y-%m-%d')
+    else:
+        print("depress( ['day', 'week', 'month'] )")
+        return
+
+    # 주식 이름 선택 및 리스트 변환
+    df = select_stock('all', stock_last_day, stock_last_day)
+    name = df['Name'].to_list()
+
+    # 데이터 처리 루프
+    count = 0
+    depress_list = []
+    for stock_name in name:
+        df = day_week_month_data(market=stock_name, from_day=from_day, to_day=to_day, period=period)
+
+	# 주식 데이터 계산 및 처리
+	df['yesterday'] = df.Close.shift(1)
+	df['minus'] = (df['Close'] - df['yesterday']) < 0
+	df1 = df.sort_values(by=['Date'], axis=0, ascending=False, ignore_index=True)
+	minus = df1.minus.values
+
+	count = 0
+	depress_list = []
+	for i in minus:
+		if i:
+			count += 1
+		else:
+			break
+	depress_list.append(count)
+
+	# 데이터프레임 생성 및 저장
+	df2 = pd.DataFrame({'name': name, 'count': depress_list})
+	df3 = df2.sort_values(by=['count'], axis=0, ascending=False, ignore_index=True)
+	
+	# 조건에 따른 데이터 처리
+    if period == 'month':
+        df3 = df3.iloc[:100]
+    elif period == 'week':
+        df3 = df3.iloc[:200]
+    elif period == 'day':
+        df3 = df3.iloc[:300]
+    else:
+        pass
+	df3.to_excel(path_depress + period + str_today + '.xlsx')
+
+def candle_graph(market='kospi', from_day='2020-01-01', period='week'):
+    """
+    주어진 시장과 기간에 대한 캔들 그래프를 생성하는 함수.
+    """
+    df = day_week_month_data(market, from_day, period)
+
+	# 캔들스틱 차트 데이터 준비
+	df = df[['Date', 'Open', 'High', 'Low', 'Close']]
+	offline.init_notebook_mode(connected=True)
+
+	# 캔들스틱 그래프 생성
+	trace = go.Candlestick(x=df.Date, open=df.Open, high=df.High, low=df.Low, close=df.Close, increasing_line_color='red', decreasing_line_color='blue')
+	data = [trace]
+	layout = go.Layout(title=market)
+	fig = go.Figure(data=data, layout=layout)
+	offline.iplot(fig, filename='candlestick')
+
+def bokeh_chart(market='kospi', from_day='2019-01-01', period='month'):
+    """
+    주어진 시장과 기간에 대한 Bokeh 차트를 생성하는 함수.
+    """
+    from math import pi
+    from bokeh.io import output_notebook, show
+    from bokeh.plotting import figure
+    from bokeh.layouts import gridplot
+    output_notebook()
+
+    # Bokeh 차트 데이터 준비
+    df = day_week_month_data(market, from_day, period)
+    df = df.set_index(df['Date'], drop=True)
+    df.rename(columns={'Date': 'Date1'}, inplace=True)  # Bokeh 차트에서 Date 인덱스 사용을 위해
+    mids = (df.Open + df.Close) / 2
+    spans = abs(df.Close - df.Open)
+    inc = df.Close >= df.Open
+    dec = df.Open > df.Close
+
+	# Bokeh 차트 설정 및 생성
+
+	TOOLS = "pan,wheel_zoom,box_zoom,reset,save,crosshair"
+
+	p_candlechart = figure(x_axis_type="datetime", tools=TOOLS, plot_width=900, plot_height=200, toolbar_location="left", title=market)
+	p_candlechart.xaxis.major_label_orientation = pi/4
+    p_candlechart.segment(df.index[inc], df.High[inc], df.index[inc], df.Low[inc], color="red")
+    p_candlechart.segment(df.index[dec], df.High[dec], df.index[dec], df.Low[dec], color="blue")
+    p_candlechart.vbar(df.index[inc], 0.5, df.Open[inc], df.Close[inc], fill_color="red", line_color="red",line_width=10)
+    p_candlechart.vbar(df.index[dec], 0.5, df.Open[dec], df.Close[dec], fill_color="blue", line_color="blue",line_width=10)
+
+	# 볼륨 차트 구성
+	p_volumechart = figure(x_axis_type="datetime", tools=TOOLS, plot_width=900, plot_height=200, toolbar_location="left")
+    p_volumechart.vbar(df.index, 0.5, df.Volume, fill_color="black", line_color="black",line_width=10)
+	
+	# 차트 표시
+    p = figure(tools='crosshair', plot_width=900, toolbar_location="left")
+    p = gridplot([[p_candlechart], [p_volumechart]], toolbar_location='left')	
+	show(p)
+
+def bad_stock():
+    """
+    주식 관련 데이터를 수집하고 처리하는 함수.
+    """
+    # 데이터베이스 테이블 초기화 및 웹 스크래핑 로직
+    engine.execute("TRUNCATE TABLE badstock")
+    
+    url = 'https://finance.naver.com/sise/management.nhn'
+    source = urlopen(url).read()   # 지정한 페이지에서 코드 읽기
+    source = BeautifulSoup(source, 'lxml')   # 뷰티풀 스프로 태그별로 코드 분류
+    data = []
+
+	path = 'd:\\stockdata\\관리종목\\' + str_today + '.xlsx'
+	# 웹 스크래핑 및 데이터 처리
+    body = source.find('body')
+    trs = body.find_all('tr')
+    name = []
+    for tr in trs:
+        tds = tr.find_all('a',{'class':"tltle"})
+        for td in tds:
+            name.append(td.text.strip())
+
+    df = pd.DataFrame(name)
+    df['Date']=str(str_today)
+    df = df.set_index('Date')
+    df.columns=['Name']
+    df.to_excel(path)
+    df = pd.read_excel(path)
+    df.to_sql(name='badstock', con=engine, if_exists='append', index = False)
+    return df
+
+def from_excel_analysis(path, file_day, from_date):
+    """
+    엑셀 파일에서 데이터를 읽고 분석하는 함수.
+    """
+    df = pd.read_excel(path + file_day + '.xlsx')
+    df.columns = map(str.lower, df.columns)  # 컬럼명 소문자로 변환
+    name = df['name'].to_list()
+    # 주식 데이터 분석 로직
+    name=df.to_list()
+    for i in name:
+        df=select_stock(i,from_date,)
+        close_ma_vol(df, 'ma60')
+
+def last_page(source):
+    """
+    웹 페이지의 마지막 페이지 번호를 찾는 함수.
+    """
+    last = source.find('td', class_='pgRR').find('a')['href']
+    last = int(last.split('page')[1].split('=')[1])
+    return last
+
+def select_market_at(name, at_date):
+    """
+    특정 날짜의 시장 데이터를 조회하는 함수.
+    """
+    select_query = "select * from "
+    date_query = " where Date = "    
+    df = pd.read_sql(select_query + name + date_query + "'" + at_date + "'", engine)
+    return df
+
+def select_market_period(name, from_date):
+    """
+    특정 기간의 시장 데이터를 조회하는 함수.
+    """
+    select_query = "select * from "
+    date_query = " where Date >= "    
+    df = pd.read_sql(select_query + name + date_query + "'" + from_date + "'", engine)
+    return df
+
+def select_stock(name, from_date, to_date=str_today):
+    """
+    특정 주식 또는 모든 주식에 대한 데이터를 선택하는 함수.
+    """
+    select_query = "select * from market where Name=" + ("'*'" if name == 'all' else "'" + name + "'") + " and Date >= '" + from_date + "' and Date <= '" + to_date + "'"
+    df = pd.read_sql(select_query, engine)
+    return df
+
+def make_name_list(path_name=path_depress, arg="*day*.*", num=0, degree=30):
+    """
+    특정 경로에서 파일을 검색하고 주식 이름 목록을 생성하는 함수.
+    """
+    files = glob.glob(os.path.join(path_name, arg))
+    try:
+        aa = re.findall('\d+', files[num])
+        bb = [aa[0] + '-' + aa[1] + '-' + aa[2]]
+        df = pd.read_excel(files[num], index_col=0)
+        name = df['Name'][:degree] if len(df) > 50 else df['Name']
+        name = name.tolist()
+        print(bb)
+    except Exception as e:
+        print(f"Error: {e}")
+        name = []
+    return name
+
+def min_max(df, select):
+    """
+    주식 데이터에 대한 최소-최대 정규화를 수행하는 함수.
+    """
+    df.columns = df.columns.str.lower()
+    ma(df)
+    source = MinMaxScaler()
+    data = source.fit_transform(df[['close', select, 'volume']].values)
+    df1 = pd.DataFrame(data, columns=['close', select, 'volume'], index=df.index)
+    return df1
+
+def ma(DataFrame):
+    """
+    주어진 데이터프레임에 대해 여러 이동 평균을 계산하는 함수.
+    """
+    try:
+        df = DataFrame.copy()
+        df.columns = df.columns.str.lower()
+        df[['volume', 'close']] = df[['volume', 'close']].astype(float)  # TA-Lib 계산을 위해 실수 타입으로 변환
+
+        # 여러 이동 평균 계산
+        df['ma5'] = ta.MA(df, timeperiod=5)
+        df['ma10'] = ta.MA(df, timeperiod=10)
+        df['ma15'] = ta.MA(df, timeperiod=15)
+        df['ma20'] = ta.MA(df, timeperiod=20)
+		df['ma30'] = ta.MA(df, timeperiod=30)
+		df['ma60'] = ta.MA(df, timeperiod=60)
+		df['ma120'] = ta.MA(df, timeperiod=120)		
+		
+    except Exception as e:
+        print(f"Error in MA calculation: {e}")
+    return df
+
+
+
+# 다양한 그래프 생성 함수들
+def stock_volume_graph(name, date_list):
+    for i in name:
+        for j in date_list:
+            df = select_stock(i, j,)
+            close_ma_vol(df,'ma60','ma120','volume')
+
+def stock_close_graph(name, date_list):
+    for i in name:
+        for j in date_list:
+            df = select_stock(i, j,)
+            close_ma(df,'ma60','ma120')
+
+def market_volume_graph(name, date_list):
+    for i in name:
+        for j in date_list:
+            df = select_market(i, j,)
+            market_ma_vol(df,'ma60','ma120','volume')
+
+def market_close_graph(name, date_list):
+    for i in name:
+        for j in date_list:
+            df = select_market_period(i, j)
+            market_ma(df,'ma60','ma120') 
+
+# close_ma 함수
+def close_ma(df, select1='ma60', select2='ma120'):
+    """
+    주어진 데이터프레임에 대해 이동 평균 및 종가 데이터를 시각화하는 함수.
+    """
+    ma(df)
+    source = MinMaxScaler()
+    data = source.fit_transform(df[['close', select1, select2]].values)
+    df1 = pd.DataFrame(data, columns=['close', select1, select2], index=df.index)
+    df1.plot(figsize=(16, 4))
+    plt.title(df['name'][0])
+    plt.grid(True)
+    plt.show()
+
+def close_ma_vol(df, select1='ma60', select2='ma120', select3='volume'):
+    """
+    주어진 데이터프레임에 대해 이동 평균, 종가, 거래량 데이터를 시각화하는 함수.
+    """
+    try:
+        ma(df)
+        # 데이터 정규화 및 시각화
+        source = MinMaxScaler()
+        data = source.fit_transform(df[['close', select1, select2, select3]].values)
+        df1 = pd.DataFrame(data, columns=['close', select1, select2, select3], index=df.index)
+        df1.plot(figsize=(16, 4))
+        plt.title(df['name'][0])
+        plt.grid(True)
+        plt.show()
+    except Exception as e:
+        print(f"Error in close_ma_vol: {e}")
+
+def market_ma(df, select1, select2):
+    """
+    시장 데이터에 대한 이동 평균을 계산하는 함수.
+    """
+    ma(df)
+    # 데이터 정규화 및 시각화
+    source = MinMaxScaler()
+    data = source.fit_transform(df[['close', select1, select2]].values)
+    df1 = pd.DataFrame(data, columns=['close', select1, select2], index=df.index)
+    df1.plot(figsize=(16, 4))
+    plt.title(df['market'][0])
+    plt.grid(True)
+    plt.show()
+
+def market_ma_vol(df, select1, select2, select3):
+    # Apply moving average
+    ma(df)
+
+    # Scale and transform data
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(df[['close', select1, select2, select3]].values)
+    
+    # Create a new DataFrame with scaled data
+    scaled_df = pd.DataFrame(scaled_data, columns=['close', select1, select2, select3])
+    scaled_df = scaled_df.set_index(df['date'])
+    
+    # Plotting
+    scaled_df.plot(figsize=(16, 4))
+    plt.title(df['market'][0])
+    plt.grid(True)
+    plt.show()
+
+def make_dataset(stock_name, from_date):
+    columns = ['ma5', 'ma10', 'ma15', 'ma20', 'ma30', 'ma60', 'ma120', 'volume', 'close']
+    df = select_stock(stock_name, from_date)
+
+    # Apply moving average
+    ma(df)
+    df = df.iloc[120:]
+    stock_title = df['name'][120]
+
+    # Scale and transform data
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(df[columns].values.astype(float))
+    
+    # Create a new DataFrame with scaled data
+    scaled_df = pd.DataFrame(scaled_data, columns=columns)
+    scaled_df = scaled_df.set_index(df['date'])
+    
+    return scaled_df
+
+def select_graph(path_name, date, from_day='2019-01-01', stock_count=30, analysis_method=close_ma_vol, fixed_selection=True):
+    # Load stock names from the specified file
+    stock_names = pd.read_excel(f"{path_name}{date}.xlsx")
+    stock_names.columns = map(str.lower, stock_names.columns)
+    stock_names = stock_names['name']
+    print('Total stocks:', stock_names.shape[0])
+    
+    # Select stocks based on the 'fixed_selection' parameter
+    selected_stocks = stock_names.iloc[:stock_count] if fixed_selection else stock_names.iloc[stock_count:stock_count+5]
+    selected_stocks = selected_stocks.to_list()
+    
+    # Process each stock
+    for stock in selected_stocks:
+        df = select_stock(stock, from_day)
+        method(df)
+
+def period_down(from_day, to_day):
+    start = time.time()
+
+    # Retrieving the latest date from the 'market' table
+    df_date = pd.read_sql("select Date from market where Name='hrs' order by Date desc limit 1", engine)
+    df_date = pd.to_datetime(df_date['Date'])
+    df_date = str(df_date)
+    standard = df_date[4:14]  # Extracting date in 'YYYY-MM-DD' format
+
+    # Constructing SQL query
+    query = f"select Name, min(Close) from market where Date > '{from_day}' and Date <= '{to_day}' group by Name"
+    
+    # Executing query and processing data
+    df = pd.read_sql(query, engine)
+    df1 = select_stock('all', standard)
+    df1_last = df1[['Name', 'Close']]
+
+    # Merging and processing data
+    df2 = pd.merge(df, df1_last, on="Name")
+    df2['diff'] = df2['Close'] / df2['min(Close)']
+    df2 = df2.sort_values(by=['diff'], ascending=True)
+    df2 = df2.reset_index(drop=True)
+    
+    # Uncomment to display or save the resulting DataFrame
+    # display(df2)
+    # df2.to_excel(path_data + 'output.xlsx')
+
+    # Calculating execution time
+    end = time.time()
+    print(f"Execution Time: {end - start} seconds")
+
+class analysis:
+
+    # Other class variables and methods...
+
+    def search_stock_long_period_graph(self, path, select_day, select_start='2019-01-01', to_day='2021-12-31'):
+        stock_names_df = pd.read_excel(f"{path}{select_start}_{select_day}.xlsx")
+        stock_names = stock_names_df['name'].to_list()
+
+        for stock_name in stock_names:
+            stock_data = select_stock(stock_name, self.from_date, self.to_date)
+            close_ma_vol(stock_data)
+
+    def search_stock_long_period(self, name, select_start):
+        start = time.time()
+        print(select_start)
+
+        datelist = self.datelist
+        combined_df = pd.DataFrame()
+
+        for stock_name in name:
+            stock_data = select_stock(stock_name, self.from_day, self.to_day)
+            ma(stock_data)
+            scaled_data = MinMaxScaler().fit_transform(stock_data[['close', 'ma60', 'ma120', 'volume']].values)
+            temp_df = pd.DataFrame(scaled_data, columns=['close', 'ma60', 'ma120', 'volume'])
+            temp_df['name'] = stock_name
+            temp_df[['date', 'code']] = stock_data[['date', 'code']]
+            combined_df = combined_df.append(temp_df)
+
+        # Further processing and saving to Excel files
+        # ...
+
+        print('Time elapsed:', time.time() - start)
+
+class to_report:
+    select_query = "select * from market where Date >="
+    volume_query = "&& Volume >  10000"
+
+    def stock_select_with_Volume_Close(self, choice=1):
+        if choice == 1:
+            yesterday = input("어제날짜를 입력하세요 : sample: '2019-02-07'  ") or str_yesterday
+            today = input("오늘날짜를 입력하세요 : sample: '2019-02-07'  ") or str_today
+        else:
+            day_df = pd.read_sql("select Date from market where Name='삼성전자' order by Date desc limit 2", engine)
+            from_day, to_day = day_df['Date'].astype(str)
+
+        df = select_stock('all', from_day)
+        df = df[df['Volume'] > 300000].reset_index(drop=True)
+
+        df1 = df[df['Date'].astype(str) == from_day][['Name', 'Volume', 'Close']]
+        df2 = df[df['Date'].astype(str) == to_day][['Name', 'Volume', 'Close']]
+        df1.columns = ['Name', 'yester_Volume', 'yester_Close']
+        df2.columns = ['Name', 'today_Volume', 'today_Close']
+
+        merged_df = pd.merge(df1, df2, on='Name')
+        merged_df['Close'] = merged_df['today_Close'] / merged_df['yester_Close']
+        merged_df['Volume'] = merged_df['today_Volume'] / merged_df['yester_Volume']
+        merged_df = merged_df.sort_values(by=['Volume', 'Close'], ascending=False).reset_index(drop=True)
+
+        top_volume = merged_df.head(15)
+        top_close = merged_df.sort_values(by=['Close', 'Volume'], ascending=False).head(15)
+
+        top_volume.to_excel(path_volume + to_day + '.xlsx')
+        top_close.to_excel(path_price + to_day + '.xlsx')
+        display(top_volume)
+        display(top_close)
+
+
+
+class to_sql:
+    excel_name_list = ['kpi200.xlsx', 'investor_trend.xlsx', 'money_trend.xlsx', 'program_trend.xlsx', 'kospi_sector.xlsx', 'kosdaq_sector.xlsx', 'market.xlsx', 'kospi.xlsx', 'kosdaq.xlsx']
+    sql_table_name_list = ['kpi200', 'investortrend', 'moneytrend', 'programtrend', 'kospi_sector', 'kosdaq_sector', 'market', 'kospi', 'kosdaq']
+
+    def excel_to_sql(self, choice=1):
+        if choice == 1:
+            file_name = input('파일이름을 입력하세요:')
+            df = pd.read_excel(f'C:/Users/linux/OneDrive/{file_name}')
+            table_name = self.get_table_name(file_name, df)
+
+            if file_name == 'market.xlsx':
+                self.process_market_data(df)
+                return
+            elif table_name:
+                df.to_sql(name=table_name, con=engine, if_exists='append', index=False)
+                print(df)
+            else:
+                print('\\n file_name error\\n')
+        else:
+            self.process_all_files()
+
+    def get_table_name(self, file_name, df):
+        column_mappings = {
+            'kpi200.xlsx': ('kpi200', ['Date', 'kpi200', '거래량']),
+            'investor_trend.xlsx': ('investortrend', ['Date', '개인', '외국인', '기관']),
+            'money_trend.xlsx': ('moneytrend', ['Date', '고객예탁금', '신용잔고', '주식형펀드', '혼합형펀드', '채권형펀드']),
+            # Add other file mappings here...
+        }
+        if file_name in column_mappings:
+            table_name, columns = column_mappings[file_name]
+            df.columns = columns
+            return table_name
+        return None
+
+    def process_market_data(self, df):
+        # Special processing for market data
+        # ...
+
+    def process_all_files(self):
+        # Process all files in the excel_name_list
+        # ...
+
+
+
+
+class to_excel:
+    # URLs for data sources
+    investor_trend_url = 'http://finance.naver.com/sise/investorDealTrendDay.nhn?bizdate=20220601&sosok=&page='
+    money_trend_url = 'http://finance.naver.com/sise/sise_deposit.nhn?&page='
+    kpi200_url = 'https://finance.naver.com/sise/sise_index_day.nhn?code=KPI200&page='
+    program_trend_url = 'https://finance.naver.com/sise/programDealTrendDay.nhn?bizdate=20221215&sosok=&page='    
+    future_url = 'http://finance.daum.net/api/future/KR4101PC0002/days?pagination=true&page='
+    kospi_sector_url = "http://finance.daum.net/api/quotes/sectors?fieldName=&order=&perPage=&market=KOSPI&page=&changes=UPPER_LIMIT%2CRISE%2CEVEN%2CFALL%2CLOWER_LIMIT"
+    kosdaq_sector_url = "http://finance.daum.net/api/quotes/sectors?fieldName=&order=&perPage=&market=KOSDAQ&page=&changes=UPPER_LIMIT%2CRISE%2CEVEN%2CFALL%2CLOWER_LIMIT"
+
+    # Helper methods for fetching and processing data
+    def fetch_data(self, url, parse_function, *args):
+        # Fetch data from URL and parse with given function
+        # ...
+class to_excel:
+    # ... [other class variables and methods]
+
+    def fetch_data(self, url, parse_function, *parse_args):
+        """
+        Fetch data from a given URL and parse it using the specified function.
+
+        Parameters:
+        url (str): The URL to fetch data from.
+        parse_function (function): The function used to parse the fetched data.
+        parse_args (tuple): Additional arguments to pass to the parse function.
+
+        Returns:
+        list: Parsed data as a list of dictionaries or a DataFrame.
+        """
+        import requests
+        from bs4 import BeautifulSoup
+
+        # Initialize an empty list to store parsed data
+        parsed_data = []
+
+        # Fetch the last page number if pagination is involved
+        response = requests.get(url)
+        soup = BeautifulSoup(response.content, 'lxml')
+        last_page = self.get_last_page_number(soup)  # Assuming this method exists to find the last page number
+
+        # Loop through all pages and parse data
+        for page in range(1, last_page + 1):
+            page_url = f"{url}{page}"
+            response = requests.get(page_url)
+            soup = BeautifulSoup(response.content, 'lxml')
+            
+            # Parse the page using the provided function and arguments
+            page_data = parse_function(soup, *parse_args)
+            
+            # Append or concatenate the parsed data
+            parsed_data.extend(page_data)
+
+        return parsed_data
+
+    # ... [other methods]
+		
+
+    def process_and_save_data(self, data, filepath):
+        # Process and save data to Excel
+        # ...
+class to_excel:
+    # ... [other class variables and methods]
+
+    def process_and_save_data(self, data, filepath, sort_by=None):
+        """
+        Process the fetched data and save it to an Excel file.
+
+        Parameters:
+        data (list or DataFrame): The data to be processed and saved.
+        filepath (str): The file path where the Excel file will be saved.
+        sort_by (str, optional): Column name to sort the data by.
+
+        Returns:
+        None: This function doesn't return anything. It saves the data to an Excel file.
+        """
+        import pandas as pd
+
+        # Convert the data to a DataFrame if it's not already one
+        if not isinstance(data, pd.DataFrame):
+            data = pd.DataFrame(data)
+
+        # Sort the data if a sort column is provided
+        if sort_by is not None and sort_by in data.columns:
+            data = data.sort_values(by=sort_by)
+
+        # Save the processed data to an Excel file
+        data.to_excel(filepath, index=False)
+        print(f"Data successfully saved to {filepath}")
+
+    # ... [other methods]
+		
+		
+
+    # Method for getting investor trend data
+    def get_investor_trend(self):
+        data = self.fetch_data(self.investor_trend_url, self.parse_investor_trend)
+        self.process_and_save_data(data, 'C:/Users/linux/OneDrive/investor_trend.xlsx')
+
+    # Parsing method for investor trend
+    def parse_investor_trend(self, page_content):
+        # Parse the investor trend data from page content
+        # ...
+
+    # Other methods similar to get_investor_trend for different data sources
+    def get_investor_trend_date(self, until_date=str_yesterday, choice=1):
+        # Method to get investor trend data up to a specific date
+        # ...
+
+    def get_money_trend(self):
+        # Method for getting money trend data
+        # ...
+
+    def get_money_trend_date(self, until_date=str_today, choice=1):
+        # Method to get money trend data up to a specific date
+        # ...
+
+    def get_kpi200(self):
+        # Method for getting KPI200 data
+        # ...
+
+    def get_kpi200_date(self, until_date=str_yesterday, choice=1):
+        # Method to get KPI200 data up to a specific date
+        # ...
+
+    def get_program_trend(self):
+        # Method for getting program trend data
+        # ...
+
+    def get_program_trend_date(self, until_date=str_yesterday, choice=1):
+        # Method to get program trend data up to a specific date
+        # ...
+
+    # Additional methods for future and sector data
+    def future(self, choice=1):
+        # Method for fetching future data
+        # ...
+
+    def sector(self):
+        # Method for fetching sector data
+        # ...
+
+    def kospi_kosdaq(self):
+        # Method for fetching KOSPI and KOSDAQ data
+        # ...
+
+

@@ -1,0 +1,13 @@
+{
+    "name": "zepeto-spider-controller",
+    "version": "1.0.0",
+    "description": "ZEPETO Spider Controller",
+    "main": "dist/SpiderCrawlController.js",
+    "scripts": {
+        "build": "tsc",
+        "watch": "tsc -w"
+    },
+    "devDependencies": {
+        "typescript": "^4.9.5"
+    }
+} 

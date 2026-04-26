@@ -1,0 +1,932 @@
+# Import necessary libraries
+import datetime as dt
+import glob
+import io
+import json
+import os
+import re
+import shutil
+import sys
+import time
+import urllib.request as req
+import warnings
+from datetime import datetime, timedelta
+from urllib.request import urlopen
+
+import FinanceDataReader as fdr
+import mplfinance as mpf
+import numpy as np
+import pandas as pd
+import plotly.graph_objs as go
+import plotly.offline as offline
+import pymysql
+import sqlalchemy
+import talib.abstract as ta
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
+from keras.layers import Activation, Dense, Dropout, LSTM
+from keras.models import Sequential
+from pykrx.stock.api import *
+from sklearn.preprocessing import MinMaxScaler
+from talib import BBANDS, RSI
+
+# Configure plot settings
+import matplotlib.pyplot as plt
+from matplotlib import font_manager, rc
+from pandas.plotting import register_matplotlib_converters
+
+plt.rcParams.update({'figure.max_open_warning': 0})
+plt.rcParams['axes.unicode_minus'] = False
+plt.rc('axes', unicode_minus=False)
+font_name = font_manager.FontProperties(fname="c:/Windows/Fonts/malgun.ttf").get_name()
+rc('font', family=font_name)
+register_matplotlib_converters()
+
+# Database and other configurations
+HOST = "localhost"
+PORT = 3306
+USER = "root"
+PASSWORD = "leaf2027"  # Placeholder for password
+DATABASE = "stock"
+TODAY = datetime.now()
+STR_YESTERDAY = (TODAY - timedelta(1)).strftime('%Y-%m-%d')
+STR_TODAY = TODAY.strftime('%Y-%m-%d')
+THREE_PERIODS = ['day', 'week', 'month']
+
+# Database connections
+connection = pymysql.connect(host=HOST, port=PORT, user=USER, password=PASSWORD, database=DATABASE)
+engine = sqlalchemy.create_engine(f'mysql+pymysql://{USER}:{PASSWORD}@{HOST}/{DATABASE}?charset=utf8', encoding='utf-8')
+conn = pymysql.connect(host=HOST, port=PORT, user=USER, password=PASSWORD, database=DATABASE)
+curs = conn.cursor()
+
+# Fetch last day of stock data
+stock_last_day = pd.read_sql("SELECT Date FROM market WHERE Name='삼성전자' ORDER BY Date DESC LIMIT 1", engine)
+stock_last_day['Date'] = pd.to_datetime(stock_last_day['Date']).dt.strftime('%Y-%m-%d')
+STOCK_LAST_DAY = stock_last_day['Date'].to_list()[0]
+
+# Paths for data
+PATH_TEST = 'C:/Users/linux/OneDrive/stockdata/test_data/'
+PATH_DOWN = 'C:/Users/linux/OneDrive/stockdata/period_down/'
+PATH_DEPRESS = 'C:/Users/linux/OneDrive/stockdata/depress/'
+PATH_MA = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_ma_'
+PATH_CLOSE = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_close_'
+PATH_CLOSE_MA120 = 'C:/Users/linux/OneDrive/stockdata/close_ma120/'
+
+# Fetch final day of KOSPI data
+kospi_final_day_df = pd.read_sql("SELECT Date FROM kospi ORDER BY Date DESC LIMIT 1", engine)
+final_day = kospi_final_day_df
+kospi_final_day_df = pd.to_datetime(kospi_final_day_df['Date'])
+kospi_next_df = kospi_final_day_df + timedelta(1)
+KOSPI_NEXT_DAY_NO_HYPHEN = kospi_next_df.strftime('%Y-%m-%d').replace('-', '')
+
+def compare_graph(path_name, day, from_day, subject, count=5):
+    """Generates comparison graphs for stocks."""
+    name_df = pd.read_excel(f"{path_name}{day}.xlsx")
+    name_df.columns = map(str.lower, name_df.columns)
+    selected_names = name_df['name'].iloc[count:count + 5].to_list()
+    combined_df = pd.DataFrame()
+
+    for stock_name in selected_names:
+        stock_data = select_stock(stock_name, from_day)
+        stock_data = stock_data[["Date", subject]]
+        stock_data.columns = ['Date', stock_name]
+        combined_df = pd.merge(stock_data, combined_df, on="Date", how="outer") if not combined_df.empty else stock_data
+    
+    combined_df.set_index("Date", inplace=True)
+    normalized_data = combined_df.div(combined_df.iloc[0]).mul(100)
+    normalized_data.plot(figsize=(12, 5))
+    plt.legend(normalized_data.columns, loc=0)
+    plt.grid(True, color='0.7', linestyle=':', linewidth=2)
+
+def kospi_kosdaq(last_day="20251231", market="1001"):
+    """Updates KOSPI or KOSDAQ data in the database."""
+    market_type = "kospi" if market == "1001" else "kosdaq"
+    market_data = get_index_ohlcv_by_date(KOSPI_NEXT_DAY_NO_HYPHEN, last_day, market)
+    market_data.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+    market_data['Market'] = market_type
+    market_data.to_sql(name=market_type, con=engine, if_exists='append')
+
+def compare_graph_with_name(names, date="2020-01-01"):
+    """Generates comparison graphs for given stock names from a specific date."""
+    combined_df = pd.DataFrame()
+    for stock_name in names:
+        query = f"SELECT Date, Close, Volume FROM market WHERE Name='{stock_name}' AND Date > '{date}'"
+        stock_data = pd.read_sql(query, engine)
+        stock_data = stock_data.set_index("Date")
+        combined_df[stock_name + "_Close"] = stock_data["Close"]
+        combined_df[stock_name + "_Volume"] = stock_data["Volume"]
+
+    # Normalize data for plotting
+    normalized_data = combined_df.div(combined_df.iloc[0]).mul(100)
+    plot_stock_data(normalized_data, [name + "_Close" for name in names])
+    plot_stock_data(normalized_data, [name + "_Volume" for name in names])
+
+def plot_stock_data(df, column_names):
+    """Plots stock data for given column names."""
+    plt.figure(figsize=(16, 5))
+    for column in column_names:
+        plt.plot(df[column], label=column)
+    plt.legend(loc=0)
+    plt.grid(True, color='0.7', linestyle=':', linewidth=1)
+    plt.show()def day_week_month_data(market='kospi', from_day='2020-01-01', to_day=str_today, period='month'):
+    """Aggregates stock data by day, week, or month."""
+    data_source = select_market_period(market, from_day) if market in ['kospi', 'kosdaq'] else select_stock(market, from_day, to_day)
+    data_source['Date'] = pd.to_datetime(data_source['Date'])
+    period_groups = data_source.groupby(pd.Grouper(key='Date', freq=period[0].upper()))
+    return period_groups.agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).reset_index()
+
+def depress(period='day', to_day=str_today):
+    """Analyzes and records stock depression data."""
+    path_depress = 'C:/Users/linux/OneDrive/stockdata/depress/depress_'
+    from_day = (pd.to_datetime(to_day) - timedelta(days={'day': 60, 'week': 180, 'month': 730}[period])).strftime('%Y-%m-%d')
+    all_stocks = select_stock('all', stock_last_day, stock_last_day)['Name'].to_list()
+    depress_data = []
+
+    for stock in all_stocks:
+        stock_data = day_week_month_data(stock, from_day, to_day, period)
+        stock_data['yesterday'] = stock_data.Close.shift(1)
+        stock_data['minus'] = (stock_data['Close'] - stock_data['yesterday']) < 0
+        consecutive_depress_days = stock_data['minus'].idxmax() if stock_data['minus'].any() else 0
+        depress_data.append(consecutive_depress_days)
+
+    depression_summary = pd.DataFrame({'Name': all_stocks, 'DepressionDays': depress_data}).sort_values(by='DepressionDays', ascending=False)
+    depression_summary.to_excel(path_depress + period + str_today + '.xlsx')
+
+def candle_graph(market='kospi', from_day='2020-01-01', period='week'):
+    """Generates a candlestick graph for a specified market."""
+    data_for_graph = day_week_month_data(market, from_day, period=period)[['Date', 'Open', 'High', 'Low', 'Close']]
+    candlestick_trace = go.Candlestick(x=data_for_graph.Date, open=data_for_graph.Open, high=data_for_graph.High, low=data_for_graph.Low, close=data_for_graph.Close,
+                                       increasing_line_color='red', decreasing_line_color='blue')
+    fig = go.Figure(data=[candlestick_trace], layout=go.Layout(title=market))
+    offline.iplot(fig, filename='candlestick')
+	
+def bokeh_chart(market='kospi', from_day='2019-01-01', period='month'):
+    """Generates an interactive chart using Bokeh for stock data."""
+    from bokeh.plotting import figure, show, output_notebook
+    from math import pi
+    output_notebook()
+    market_data = day_week_month_data(market, from_day, period).set_index('Date')
+    inc = market_data.Close > market_data.Open
+    dec = market_data.Open > market_data.Close
+
+    p = figure(x_axis_type='datetime', title=f"{market} Market Chart", tools='pan,wheel_zoom,box_zoom,reset,save')
+    p.segment(market_data.index[inc], market_data.High[inc], market_data.index[inc], market_data.Low[inc], color='green')
+    p.segment(market_data.index[dec], market_data.High[dec], market_data.index[dec], market_data.Low[dec], color='red')
+    p.vbar(market_data.index[inc], 0.5, market_data.Open[inc], market_data.Close[inc], fill_color='green', line_color='green')
+    p.vbar(market_data.index[dec], 0.5, market_data.Open[dec], market_data.Close[dec], fill_color='red', line_color='red')
+    show(p)
+
+def bad_stock():
+    """Collects and records data of stocks under management."""
+    url = 'https://finance.naver.com/sise/management.nhn'
+    soup = BeautifulSoup(urlopen(url), 'lxml')
+    bad_stocks = [a.text for a in soup.find_all('a', {'class': 'tltle'})]
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    bad_stock_df = pd.DataFrame({'Date': today, 'Name': bad_stocks})
+    bad_stock_df.to_excel(f'path_to_save/bad_stock_{today}.xlsx')
+    bad_stock_df.to_sql('badstock', engine, if_exists='append', index=False)
+
+def from_excel_analysis(path, file_day, from_date):
+    """Analyzes stock data from an Excel file."""
+    df = pd.read_excel(f"{path}{file_day}.xlsx").apply(lambda x: x.str.lower())
+    for stock_name in df['name']:
+        stock_data = select_stock(stock_name, from_date)
+        close_ma_vol(stock_data, 'ma60')
+		
+def last_page(source):
+    """Finds the last page number from a BeautifulSoup-parsed HTML source."""
+    last_page_link = source.find('td', class_='pgRR').find('a')['href']
+    last_page_number = int(last_page_link.split('page=')[-1])
+    return last_page_number
+
+def select_market_at(market_type, specific_date):
+    """Selects market data for a given market type and specific date."""
+    query = f"SELECT * FROM {market_type} WHERE Date = '{specific_date}'"
+    return pd.read_sql(query, engine)
+
+def select_market_period(market_type, start_date):
+    """Selects market data for a given market type over a period starting from a specific date."""
+    query = f"SELECT * FROM {market_type} WHERE Date >= '{start_date}'"
+    return pd.read_sql(query, engine)
+
+def select_stock(name, from_date, to_date=str_today):
+    """Selects stock data based on stock name and date range."""
+    query = f"SELECT * FROM market WHERE Name = '{name}' AND Date >= '{from_date}' AND Date <= '{to_date}'" if name != 'all' else \
+            f"SELECT * FROM market WHERE Date >= '{from_date}' AND Date <= '{to_date}'"
+    return pd.read_sql(query, engine)
+	
+def make_name_list(path, pattern='*day*.*', num=0, limit=30):
+    """Generates a list of names from a specified file in a directory."""
+    file_path = glob.glob(os.path.join(path, pattern))[num]
+    df = pd.read_excel(file_path, index_col=0)
+    name_list = df['Name'][:limit] if len(df) > 50 else df['Name']
+    return name_list.tolist()
+
+def min_max(df, column):
+    """Applies MinMax scaling to specified columns in a DataFrame."""
+    df.columns = df.columns.str.lower()
+    moving_averages = ma(df)
+    scaled_data = MinMaxScaler().fit_transform(df[['close', column, 'volume']].values)
+    scaled_df = pd.DataFrame(scaled_data, columns=['close', column, 'volume'])
+    scaled_df.set_index(df['date'], inplace=True)
+    return scaled_df
+
+def ma(df):
+    """Calculates moving averages for different periods and adds them to the DataFrame."""
+    df.columns = df.columns.str.lower()
+    df[['volume', 'close']] = df[['volume', 'close']].astype(float)
+    for period in [5, 10, 15, 20, 30, 60, 120]:
+        df[f'ma{period}'] = ta.MA(df, timeperiod=period)
+    return df[['ma5', 'ma10', 'ma15', 'ma20', 'ma30', 'ma60', 'ma120']]
+	
+def stock_volume_graph(stock_names, date_list):
+    """Generates volume graphs for given stocks over specified dates."""
+    for stock_name in stock_names:
+        for date in date_list:
+            stock_data = select_stock(stock_name, date)
+            close_ma_vol(stock_data, 'ma60', 'ma120', 'volume')
+
+def stock_close_graph(stock_names, date_list):
+    """Generates closing price graphs for given stocks over specified dates."""
+    for stock_name in stock_names:
+        for date in date_list:
+            stock_data = select_stock(stock_name, date)
+            close_ma(stock_data, 'ma60', 'ma120')
+
+def market_volume_graph(market_names, date_list):
+    """Generates volume graphs for given markets over specified dates."""
+    for market_name in market_names:
+        for date in date_list:
+            market_data = select_market(market_name, date)
+            market_ma_vol(market_data, 'ma60', 'ma120', 'volume')
+
+def market_close_graph(market_names, date_list):
+    """Generates closing price graphs for given markets over specified dates."""
+    for market_name in market_names:
+        for date in date_list:
+            market_data = select_market_period(market_name, date)
+            market_ma(market_data, 'ma60', 'ma120')
+
+def close_ma(df, ma1='ma60', ma2='ma120'):
+    """Plots moving averages based on the given DataFrame and selected MA periods."""
+    df_with_ma = ma(df)
+    scaled_data = MinMaxScaler().fit_transform(df_with_ma[[ma1, ma2]].values)
+    scaled_df = pd.DataFrame(scaled_data, columns=[ma1, ma2])
+    scaled_df.set_index(df['date'], inplace=True)
+    scaled_df.plot(figsize=(16, 4))
+    plt.title(df_with_ma['name'][0] if 'name' in df_with_ma.columns else 'Graph')
+    plt.grid(True)
+    plt.show()
+
+def close_ma_vol(df, ma1='ma60', ma2='ma120', volume_col='volume'):
+    """Plots moving averages and volume based on the given DataFrame and selected MA periods."""
+    df_with_ma = ma(df)
+    scaled_data = MinMaxScaler().fit_transform(df_with_ma[[ma1, ma2, volume_col]].values)
+    scaled_df = pd.DataFrame(scaled_data, columns=[ma1, ma2, volume_col])
+    scaled_df.set_index(df['date'], inplace=True)
+    scaled_df.plot(figsize=(16, 4))
+    plt.title(df_with_ma['name'][0] if 'name' in df_with_ma.columns else 'Graph')
+    plt.grid(True)
+    plt.show()
+
+def market_ma_vol(df, ma1='ma60', ma2='ma120', volume_col='volume', plot_volume=False):
+    """Plots moving averages and optionally volume for market data."""
+    df_with_ma = ma(df)
+    columns_to_scale = [ma1, ma2] + ([volume_col] if plot_volume else [])
+    scaled_data = MinMaxScaler().fit_transform(df_with_ma[columns_to_scale].values)
+    scaled_df = pd.DataFrame(scaled_data, columns=columns_to_scale)
+    scaled_df.set_index(df['date'], inplace=True)
+    scaled_df.plot(figsize=(16, 4))
+    plt.title(df_with_ma['market'][0] if 'market' in df_with_ma.columns else 'Market Graph')
+    plt.grid(True)
+    plt.show()
+	
+def make_dataset(stock_name, start_date):
+    """Generates a dataset for a given stock and start date."""
+    columns = ['ma5', 'ma10', 'ma15', 'ma20', 'ma30', 'ma60', 'ma120', 'volume', 'close']
+    stock_data = select_stock(stock_name, start_date)
+    stock_data_with_ma = ma(stock_data)
+    stock_data_with_ma = stock_data_with_ma.iloc[120:]  # Skipping the first 120 rows
+    scaled_data = MinMaxScaler().fit_transform(stock_data_with_ma[columns].values.astype(float))
+    scaled_df = pd.DataFrame(scaled_data, columns=columns)
+    scaled_df.set_index(stock_data_with_ma['date'], inplace=True)
+    return scaled_df
+
+def select_graph(path_name, day, from_day='2019-01-01', count=30, method=close_ma_vol, fix=1):
+    """Selects and plots graphs based on a specified path, day, and additional parameters."""
+    name_df = pd.read_excel(f'{path_name}{day}.xlsx').applymap(str.lower)
+    names = name_df['name'].iloc[:count] if fix == 1 else name_df['name'].iloc[count:count+5]
+    print(f'all: {len(names)}')
+    for stock_name in names:
+        stock_data = select_stock(stock_name, from_day)
+        method(stock_data)
+
+def period_down(from_day, to_day):
+    """Compares stock performance over a specified period."""
+    start_time = time.time()
+    query_min_close = "SELECT Name, MIN(Close) FROM market WHERE Date BETWEEN '{}' AND '{}' GROUP BY Name".format(from_day, to_day)
+    min_close_df = pd.read_sql(query_min_close, engine)
+    latest_stock_data = select_stock('all', 'latest')
+    merged_df = pd.merge(min_close_df, latest_stock_data, on='Name')
+    merged_df['diff'] = merged_df['Close'] / merged_df['MIN(Close)']
+    merged_df.sort_values(by='diff', inplace=True)
+    merged_df.to_excel(f'{path_down}period_down_{from_day}_to_{to_day}.xlsx')
+    print(f'Processing completed in {time.time() - start_time:.2f} seconds')
+
+class Analysis:
+    def __init__(self):
+        self.select_start_a = '2019-01-01'
+        self.select_start_b = '2008-01-01'
+        self.today = datetime.now().strftime('%Y-%m-%d')
+        self.from_day = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+        self.df3 = pd.read_sql("SELECT Date FROM market WHERE Name='hrs' AND Date >= '{}'".format(self.from_day), engine)
+        self.datelist = self.df3['Date'].tolist()
+
+    def search_stock_long_period_graph(self, path, select_day, select_start=None, to_day='2021-12-31'):
+        select_start = select_start or self.select_start_a
+        stock_names = pd.read_excel(f'{path}{select_start}_{select_day}.xlsx')['name'].to_list()
+        for stock_name in stock_names:
+            stock_data = select_stock(stock_name, 'from_date', 'to_date')
+            close_ma_vol(stock_data)
+
+    def search_stock_long_period(self, names, select_start):
+        start_time = time.time()
+        print(f'Starting analysis for: {select_start}')
+        df_combined = pd.DataFrame()
+        for stock_name in names:
+            stock_data = select_stock(stock_name, self.from_day, self.today)
+            ma(stock_data)
+            normalized_data = MinMaxScaler().fit_transform(stock_data[['close', 'ma60', 'ma120', 'volume']].values)
+            df_normalized = pd.DataFrame(normalized_data, columns=['close', 'ma60', 'ma120', 'volume'], index=stock_data.index)
+            df_normalized['name'] = stock_name
+            df_combined = pd.concat([df_combined, df_normalized])
+        
+        for date in self.datelist:
+            df_date = df_combined.loc[df_combined.index == date]
+            df_date_low_close = df_date[df_date['close'] < 0.1].sort_values(by='close')
+            df_date_ma_criteria = df_date[(df_date['ma120'] < 0.1) & (df_date['close'] > df_date['ma60']) & (df_date['ma60'] > df_date['ma120'])].sort_values(by='ma120')
+            # Further analysis and processing
+        print(f'Analysis completed in {time.time() - start_time:.2f} seconds')
+		
+	def to_report():
+		select_query = "SELECT * FROM market WHERE Date >= "
+		volume_query = " AND Volume > 10000"
+		
+		def stock_select_with_Volume_Close(self, choice=1):
+			if choice == 1:
+				yesterday = input("Enter yesterday's date (format: 'YYYY-MM-DD', default: yesterday's date): ") or str_yesterday
+				today = input("Enter today's date (format: 'YYYY-MM-DD', default: today's date): ") or str_today
+			else:
+				day_df = pd.read_sql("SELECT Date FROM market WHERE Name='Samsung Electronics' ORDER BY Date DESC LIMIT 2", engine)
+				from_day = str(day_df['Date'][1])
+				to_day = str(day_df['Date'][0])
+			
+			df = select_stock('all', from_day)
+			df = df[df['Volume'] > 300000]
+			df1 = df[df['Date'] == from_day][['Name', 'Volume', 'Close']]
+			df2 = df[df['Date'] == to_day][['Name', 'Volume', 'Close']]
+			df3 = pd.merge(df1, df2, on='Name', suffixes=('_yesterday', '_today'))
+			df3['Close_ratio'] = df3['Close_today'] / df3['Close_yesterday']
+			df3['Volume_ratio'] = df3['Volume_today'] / df3['Volume_yesterday']
+			df3.sort_values(by=['Volume_ratio', 'Close_ratio'], ascending=False, inplace=True)
+			df3 = df3.head(15)
+			df3.to_excel(f'{path_volume}{to_day}.xlsx')
+			return df3
+
+		def get_graph(self, choice=1):
+			graph_name_list = ['stock', 'money', 'program', 'future']
+			if choice == 1:
+				graph_type = input("Enter graph type ('money', 'program', 'stock', 'future'): ")
+				date = input("Enter start date (format: 'YYYY-MM-DD'): ") or '2019-01-01'
+				# Further processing based on graph_type and date
+				# ...
+			else:
+
+	
+
+class to_sql:
+    excel_name_list = ['kpi200.xlsx', 'investor_trend.xlsx', 'money_trend.xlsx', 'program_trend.xlsx', 'kospi_sector.xlsx', 'kosdaq_sector.xlsx', 'market.xlsx', 'kospi.xlsx', 'kosdaq.xlsx']
+    sql_table_name_list = ['kpi200', 'investortrend', 'moneytrend', 'programtrend', 'kospi_sector', 'kosdaq_sector', 'market', 'kospi', 'kosdaq']
+
+    def excel_to_sql(self, choice=1):
+        if choice == 1:
+            file_name = input('Enter file name:')
+            df = pd.read_excel(f'C:/Users/linux/OneDrive/{file_name}')
+            table_name = file_name.split('.')[0]  # Assuming table name is same as file name without extension
+            df.to_sql(name=table_name, con=engine, if_exists='append', index=False)
+            print(df)
+        else:
+            for i, excel_file in enumerate(self.excel_name_list):
+                table_name = self.sql_table_name_list[i]
+                df = pd.read_excel(f'C:/Users/linux/OneDrive/{excel_file}')
+                df = df.rename(columns={'Unnamed: 0': 'Date'})
+                df.to_sql(name=table_name, con=engine, if_exists='append', index=False)
+                print(df)    def insert_all_stock(self, end_date=datetime.now().strftime('%Y-%m-%d')):
+        file_name = input('Enter file name:')
+        toward = input('Enter saving method (excel, sql): ')
+        start_date = input("Enter start date (format: 'YYYY-MM-DD'): ")
+        table_name = input("Enter table name: ")
+
+        data = pd.read_excel(f'C:/Users/linux/OneDrive/{file_name}')
+        code_list = data['종목코드'].apply(lambda x: str(x).zfill(6)).tolist()
+        name_list = data['종목명'].tolist()
+        stock_dic = dict(zip(code_list, name_list))
+
+        for code in sorted(stock_dic.keys()):
+            df = fdr.DataReader(code, start_date, end_date)
+            df['Code'], df['Name'] = code, stock_dic[code]
+            df = df[['Code', 'Name', 'Open', 'High', 'Low', 'Volume', 'Close']]
+            if toward == 'excel':
+                df.to_excel(f'C:/Users/linux/OneDrive/data_set/kospi/{stock_dic[code]}.xlsx')
+            elif toward == 'sql':
+                df.to_sql(name=table_name, con=engine, if_exists='append')
+
+    def insert_individual_stock(self, end_date=datetime.now().strftime('%Y-%m-%d')):
+        Code = input('Enter stock Code:')
+        Name = input('Enter stock name:')
+        engine.execute("DELETE FROM market WHERE Name = %s", (Name,))
+
+        df = fdr.DataReader(Code, '1995', end_date)
+        df['Code'], df['Name'] = Code, Name
+        df = df[['Date', 'Code', 'Name', 'Open', 'High', 'Low', 'Volume', 'Close']]
+        df.to_sql(name='market', con=engine, if_exists='append', index=False)
+
+# Refactoring class to_excel...
+
+class to_excel:
+    # ... Existing methods ...
+
+    def kospi_kosdaq(self):
+        last_date_kospi = pd.read_sql("SELECT Date FROM kospi ORDER BY Date DESC LIMIT 1", engine)['Date'].iloc[0]
+        last_date_kosdaq = pd.read_sql("SELECT Date FROM kosdaq ORDER BY Date DESC LIMIT 1", engine)['Date'].iloc[0]
+
+        next_day_kospi = (pd.to_datetime(last_date_kospi) + timedelta(1)).strftime('%Y%m%d')
+        next_day_kosdaq = (pd.to_datetime(last_date_kosdaq) + timedelta(1)).strftime('%Y%m%d')
+
+        df_kospi = fdr.DataReader("KOSPI", next_day_kospi, "20250228")
+        df_kosdaq = fdr.DataReader("KOSDAQ", next_day_kosdaq, "20250228")
+
+        df_kospi.to_excel('C:/Users/linux/OneDrive/kospi.xlsx')
+        df_kosdaq.to_excel('C:/Users/linux/OneDrive/kosdaq.xlsx')
+		
+    def sector(self):
+        # Setting up headers for web requests
+        headers = {'User-Agent': UserAgent().random}
+
+        # Requesting and parsing sector data for KOSPI and KOSDAQ
+        kospi_response = req.urlopen(req.Request(self.kospi_sector_url, headers=headers)).read().decode('utf-8')
+        kosdaq_response = req.urlopen(req.Request(self.kosdaq_sector_url, headers=headers)).read().decode('utf-8')
+
+        kospi_data = json.loads(kospi_response)['data']
+        kosdaq_data = json.loads(kosdaq_response)['data']
+
+        # Converting data to DataFrame
+        kospi_df = pd.DataFrame(kospi_data)[['date', 'sectorName', 'change', 'changeRate', 'includedStocks']]
+        kosdaq_df = pd.DataFrame(kosdaq_data)[['date', 'sectorName', 'change', 'changeRate', 'includedStocks']]
+
+        # Extracting stock names and normalizing data
+        kospi_df = self._extract_stocks_and_normalize(kospi_df)
+        kosdaq_df = self._extract_stocks_and_normalize(kosdaq_df)
+
+        # Saving to excel
+        kospi_df.to_excel('C:/Users/linux/OneDrive/kospi_sector.xlsx')
+        kosdaq_df.to_excel('C:/Users/linux/OneDrive/kosdaq_sector.xlsx')
+
+    def _extract_stocks_and_normalize(self, df):
+        df['first_stock'] = df['includedStocks'].apply(lambda x: x[0]['name'] if x else None)
+        df['second_stock'] = df['includedStocks'].apply(lambda x: x[1]['name'] if len(x) > 1 else None)
+        return df[['date', 'sectorName', 'change', 'changeRate', 'first_stock', 'second_stock']]
+		
+    def kospi_kosdaq(self):
+        # Fetching the last dates for KOSPI and KOSDAQ data from the database
+        kospi_last_date = pd.read_sql("SELECT Date FROM kospi ORDER BY Date DESC LIMIT 1", engine)['Date'][0]
+        kosdaq_last_date = pd.read_sql("SELECT Date FROM kosdaq ORDER BY Date DESC LIMIT 1", engine)['Date'][0]
+
+        # Converting to datetime and adding one day for the next start date
+        next_kospi_date = (pd.to_datetime(kospi_last_date) + timedelta(days=1)).strftime('%Y%m%d')
+        next_kosdaq_date = (pd.to_datetime(kosdaq_last_date) + timedelta(days=1)).strftime('%Y%m%d')
+
+        # Fetching and saving KOSPI data
+        kospi_data = fdr.DataReader('KS11', next_kospi_date, '20250228')
+        kospi_data['Market'] = 'KOSPI'
+        kospi_data.to_sql('kospi', con=engine, if_exists='append')
+        kospi_data.to_excel('C:/Users/linux/OneDrive/kospi.xlsx')
+
+        # Fetching and saving KOSDAQ data
+        kosdaq_data = fdr.DataReader('KQ11', next_kosdaq_date, '20250228')
+        kosdaq_data['Market'] = 'KOSDAQ'
+        kosdaq_data.to_sql('kosdaq', con=engine, if_exists='append')
+        kosdaq_data.to_excel('C:/Users/linux/OneDrive/kosdaq.xlsx')
+		
+    def insert_all_stock(self, end_date=str_today):
+        # User inputs for file name, storage method, and start date
+        file_name = input('Enter file name: ')
+        storage_method = input('Enter storage method (excel or sql): ')
+        start_date = input('Enter start date (format: YYYY-MM-DD): ')
+
+        # Reading the stock data
+        stock_data = pd.read_excel(f'C:/Users/linux/OneDrive/{file_name}')
+        stock_data['Code'] = stock_data['Code'].apply(lambda x: str(x).zfill(6))
+
+        for code in stock_data['Code']:
+            df = fdr.DataReader(code, start_date, end_date)
+            df['Code'], df['Name'] = code, stock_data[stock_data['Code'] == code]['Name'].iloc[0]
+            df = df.reset_index().rename(columns={'Date': 'date', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
+
+            if storage_method == 'excel':
+                df.to_excel(f'C:/Users/linux/OneDrive/data_set/kospi/{df["Name"][0]}.xlsx')
+            elif storage_method == 'sql':
+                df.to_sql(name='market', con=engine, if_exists='append')
+				
+    def insert_individual_stock(self, end_date=str_today):
+        # User inputs for stock code and name
+        code = input('Enter stock code: ')
+        name = input('Enter stock name: ')
+
+        # Deleting existing data for the specified stock
+        delete_query = f"DELETE FROM market WHERE Name = '{name}'"
+        curs.execute(delete_query)
+        conn.commit()
+
+        # Fetching and processing new data
+        df = fdr.DataReader(code, '1995', end_date)
+        df = df.reset_index().rename(columns={'Date': 'date', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
+        df['Code'], df['Name'] = code, name
+
+        # Storing new data
+        df.to_sql(name='market', con=engine, if_exists='append')
+		
+    def sector(self):
+        # Setting up headers for requests
+        headers = {
+            'User-Agent': UserAgent().random,
+            'referer': 'http://finance.daum.net/domestic/all_stocks'
+        }
+
+        # Fetching sector data for KOSPI and KOSDAQ
+        kospi_sector_res = requests.get(self.kospi_sector_url, headers=headers).json()
+        kosdaq_sector_res = requests.get(self.kosdaq_sector_url, headers=headers).json()
+
+        # Parsing and organizing data
+        kospi_sector_df = self._process_sector_data(kospi_sector_res['data'])
+        kosdaq_sector_df = self._process_sector_data(kosdaq_sector_res['data'])
+
+        # Saving to Excel
+        kospi_sector_df.to_excel('C:/Users/linux/OneDrive/kospi_sector.xlsx')
+        kosdaq_sector_df.to_excel('C:/Users/linux/OneDrive/kosdaq_sector.xlsx')
+
+    def _process_sector_data(self, sector_data):
+        df = pd.DataFrame(sector_data)
+        df = df[['date', 'sectorName', 'change', 'changeRate', 'includedStocks']]
+        df['changeRate'] *= 100  # Converting to percentage
+        df['first'] = df['includedStocks'].apply(lambda x: x[0]['name'])
+        df['second'] = df['includedStocks'].apply(lambda x: x[1]['name'])
+        df.drop('includedStocks', axis=1, inplace=True)
+        df = df.sort_values(by=['change', 'changeRate'], ascending=False)
+        return df.set_index('date')
+		
+    def kospi_kosdaq(self):
+        kospi_latest_date = self._get_latest_date_from_sql('kospi')
+        kosdaq_latest_date = self._get_latest_date_from_sql('kosdaq')
+
+        # Fetching and processing KOSPI and KOSDAQ data
+        df_kospi = fdr.DataReader('KS11', kospi_latest_date, self.today)
+        df_kospi['Market'] = 'kospi'
+        self._save_to_sql_and_excel(df_kospi, 'kospi')
+
+        df_kosdaq = fdr.DataReader('KQ11', kosdaq_latest_date, self.today)
+        df_kosdaq['Market'] = 'kosdaq'
+        self._save_to_sql_and_excel(df_kosdaq, 'kosdaq')
+
+    def _get_latest_date_from_sql(self, market):
+        query = f"SELECT Date FROM {market} ORDER BY Date DESC LIMIT 1"
+        latest_date = pd.read_sql(query, engine).iloc[0]['Date']
+        return (pd.to_datetime(latest_date) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+
+    def _save_to_sql_and_excel(self, df, market):
+        df.to_sql(name=market, con=engine, if_exists='append')
+        df.to_excel(f'C:/Users/linux/OneDrive/{market}.xlsx')
+		
+    def future(self):
+        path = 'C:/Users/linux/OneDrive/future.xlsx'
+        future_data = self._fetch_future_data()
+        future_data.to_excel(path)
+        future_data.to_sql(name='future', con=engine, if_exists='append')
+
+    def _fetch_future_data(self):
+        headers = self._generate_headers()
+        url = "http://finance.daum.net/api/future/KR4101Q30005/days?pagination=true&page=1"
+        res = req.urlopen(req.Request(url, headers=headers)).read().decode('utf-8')
+        future_json = json.loads(res)['data']
+        df = pd.DataFrame(future_json)
+        df = self._process_future_dataframe(df)
+        return df
+
+    def _generate_headers(self):
+        ua = UserAgent()
+        return {
+            'User-Agent': ua.ie,
+            'referer': 'http://finance.daum.net/domestic/futures'
+        }
+
+    def _process_future_dataframe(self, df):
+        df = df[['date', 'tradePrice', 'unsettledVolume', 'foreignSettlement', 'institutionSettlement', 'privateSettlement']]
+        df.columns = ['Date', 'Future', 'UnsettledVolume', 'Foreign', 'Institution', 'Private']
+        df['Date'] = pd.to_datetime(df['Date']).dt.date
+        return df
+		
+    def sector(self):
+        kospi_data = self._fetch_sector_data(market='kospi')
+        kosdaq_data = self._fetch_sector_data(market='kosdaq')
+
+        kospi_data.to_excel('C:/Users/linux/OneDrive/kospi_sector.xlsx')
+        kosdaq_data.to_excel('C:/Users/linux/OneDrive/kosdaq_sector.xlsx')
+
+    def _fetch_sector_data(self, market):
+        url = self.kospi_sector_url if market == 'kospi' else self.kosdaq_sector_url
+        headers = self._generate_headers()
+        res = req.urlopen(req.Request(url, headers=headers)).read().decode('utf-8')
+        sector_json = json.loads(res)['data']
+        df = pd.DataFrame(sector_json)
+        df = self._process_sector_dataframe(df)
+        return df
+
+    def _process_sector_dataframe(self, df):
+        df = df[['date', 'sectorName', 'change', 'changeRate', 'includedStocks']]
+        df = df.rename(columns={'date': 'Date', 'sectorName': 'SectorName', 'change': 'Change', 'changeRate': 'ChangeRate', 'includedStocks': 'IncludedStocks'})
+        df['ChangeRate'] = df['ChangeRate'] * 100
+        df = df.sort_values(['Change', 'ChangeRate'], ascending=[False, False])
+        df = df.apply(self._extract_stock_names, axis=1)
+        return df
+
+    def _extract_stock_names(self, row):
+        row['FirstStock'] = row['IncludedStocks'][0]['name']
+        row['SecondStock'] = row['IncludedStocks'][1]['name']
+        return row.drop('IncludedStocks')
+		
+    def kospi_kosdaq(self):
+        kospi_df = self._fetch_market_data(market='kospi')
+        kosdaq_df = self._fetch_market_data(market='kosdaq')
+
+        kospi_df.to_excel('C:/Users/linux/OneDrive/kospi.xlsx')
+        kosdaq_df.to_excel('C:/Users/linux/OneDrive/kosdaq.xlsx')
+
+    def _fetch_market_data(self, market):
+        latest_date = self._get_latest_date(market)
+        start_date = (datetime.strptime(latest_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y%m%d')
+        df = get_index_ohlcv_by_date(start_date, '20250228', market.upper())
+        df.index.names = ['Date']
+        df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        df['Market'] = market
+        return df
+
+    def _get_latest_date(self, market):
+        query = f"SELECT Date FROM {market} ORDER BY Date DESC LIMIT 1"
+        latest_date_df = pd.read_sql(query, engine)
+        return str(latest_date_df['Date'].iloc[0])
+		
+    def sector(self):
+        kospi_sector_df = self._fetch_sector_data(market='KOSPI')
+        kosdaq_sector_df = self._fetch_sector_data(market='KOSDAQ')
+
+        kospi_sector_df.to_excel('C:/Users/linux/OneDrive/kospi_sector.xlsx')
+        kosdaq_sector_df.to_excel('C:/Users/linux/OneDrive/kosdaq_sector.xlsx')
+
+    def _fetch_sector_data(self, market):
+        headers = self._get_request_headers()
+        url = f"http://finance.daum.net/api/quotes/sectors?market={market}&changes=UPPER_LIMIT%2CRISE%2CEVEN%2CFALL%2CLOWER_LIMIT"
+        sector_res = req.urlopen(req.Request(url, headers=headers)).read().decode('utf-8')
+        sector_data = json.loads(sector_res)['data']
+        sector_df = pd.DataFrame(sector_data)
+        sector_df = self._process_sector_df(sector_df)
+        return sector_df.sort_values(['change', 'changeRate'], ascending=[False, False])
+
+    def _process_sector_df(self, df):
+        df = df[['date', 'sectorName', 'change', 'changeRate', 'includedStocks']]
+        df['changeRate'] *= 100
+        df[['first', 'second']] = df['includedStocks'].apply(lambda x: [x[0]['name'], x[1]['name']] if len(x) >= 2 else [x[0]['name'], None])
+        df.drop('includedStocks', axis=1, inplace=True)
+        df.columns = ['date', 'sectorName', 'change', 'changeRate', 'first', 'second']
+        return df
+
+    def _get_request_headers(self):
+        ua = UserAgent()
+        return {
+            'User-Agent': ua.ie,
+            'referer': 'http://finance.daum.net/domestic/all_stocks'
+        }
+		
+    def kospi_kosdaq(self):
+        kospi_last_date = self._get_last_date_from_db('kospi')
+        kosdaq_last_date = self._get_last_date_from_db('kosdaq')
+
+        kospi_data = self._fetch_market_data('kospi', kospi_last_date)
+        kosdaq_data = self._fetch_market_data('kosdaq', kosdaq_last_date)
+
+        kospi_data.to_excel('C:/Users/linux/OneDrive/kospi.xlsx')
+        kosdaq_data.to_excel('C:/Users/linux/OneDrive/kosdaq.xlsx')
+
+    def _get_last_date_from_db(self, market):
+        query = f"SELECT Date FROM {market} ORDER BY Date DESC LIMIT 1"
+        last_date_df = pd.read_sql(query, engine)
+        last_date = last_date_df.iloc[0]['Date']
+        return datetime.strptime(last_date, "%Y-%m-%d") + timedelta(days=1)
+
+    def _fetch_market_data(self, market, start_date):
+        market_data = get_index_ohlcv_by_date(start_date.strftime('%Y%m%d'), "20250228", market.upper())
+        market_data.index.names = ['Date']
+        market_data.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        market_data['Market'] = market
+        return market_data
+		
+class Analysis:
+    def __init__(self):
+        self.select_start_a = '2019-01-01'
+        self.select_start_b = '2008-01-01'
+        self.today = datetime.now().strftime('%Y-%m-%d')
+        self.datelist = self._create_date_list()
+
+    def search_stock_long_period_graph(self, path, select_day, select_start=None, to_day='2021-12-31'):
+        select_start = select_start or self.select_start_a
+        stock_names = self._get_stock_names_from_excel(path, select_start, select_day)
+        for stock_name in stock_names:
+            stock_data = select_stock(stock_name, 'from_date', 'to_date')
+            close_ma_vol(stock_data)
+
+    def search_stock_long_period(self, name, select_start):
+        start_time = time.time()
+        print(f'Starting analysis for: {select_start}')
+        df_combined = self._combine_stock_data(name, from_day, to_day)
+        for date in self.datelist:
+            self._analyze_stock_data_for_date(df_combined, date, path_ma, path_close)
+        print(f'Analysis completed in {time.time() - start_time:.2f} seconds')
+
+    def _create_date_list(self):
+        last_year = datetime.now() - timedelta(days=365)
+        select_query = "SELECT * FROM market WHERE Name='hrs' AND Date >= '{}'"
+        return pd.read_sql(select_query.format(last_year.strftime('%Y-%m-%d')), engine)['Date'].tolist()
+
+    def _get_stock_names_from_excel(self, path, select_start, select_day):
+        return pd.read_excel(f'{path}{select_start}_{select_day}.xlsx')['name'].to_list()
+
+    def _combine_stock_data(self, names, from_day, to_day):
+        df_combined = pd.DataFrame()
+        for stock_name in names:
+            stock_data = select_stock(stock_name, from_day, to_day)
+            ma(stock_data)
+            normalized_data = MinMaxScaler().fit_transform(stock_data[['close', 'ma60', 'ma120', 'volume']].values)
+            df_normalized = pd.DataFrame(normalized_data, columns=['close', 'ma60', 'ma120', 'volume'], index=stock_data.index)
+            df_normalized['name'] = stock_name
+            df_combined = pd.concat([df_combined, df_normalized])
+        return df_combined
+
+    def _analyze_stock_data_for_date(self, df, date, path_ma, path_close):
+        df_date = df.loc[df.index == date]
+        df_low_close = df_date[df_date['close'] < 0.1].sort_values(by='close')
+        df_ma_criteria = df_date[(df_date['ma120'] < 0.1) & (df_date['close'] > df_date['ma60']) & (df_date['ma60'] > df_date['ma120'])].sort_values(by='ma120')
+        # Save to excel or other processing as needed
+		
+    def period_down_analysis(self, from_day, to_day, path_down):
+        start_time = time.time()
+        print(f'Running period down analysis from {from_day} to {to_day}')
+        min_close_df = self._get_min_close_stocks(from_day, to_day)
+        latest_stock_data = self._get_latest_stock_data()
+        merged_df = pd.merge(min_close_df, latest_stock_data, on='Name')
+        merged_df['diff'] = merged_df['Close'] / merged_df['Min_Close']
+        merged_df.sort_values(by='diff', inplace=True)
+        merged_df.to_excel(f'{path_down}period_down_{from_day}_to_{to_day}.xlsx')
+        print(f'Analysis completed in {time.time() - start_time:.2f} seconds')
+
+    def _get_min_close_stocks(self, from_day, to_day):
+        query_min_close = "SELECT Name, MIN(Close) AS Min_Close FROM market WHERE Date BETWEEN '{}' AND '{}' GROUP BY Name"
+        return pd.read_sql(query_min_close.format(from_day, to_day), engine)
+
+    def _get_latest_stock_data(self):
+        query_latest = "SELECT Name, Close FROM market WHERE Name='hrs' ORDER BY Date DESC LIMIT 1"
+        return pd.read_sql(query_latest, engine)
+		
+    def top_movers_analysis(self, path_volume, path_price, to_day):
+        start_time = time.time()
+        print(f'Analyzing top movers for {to_day}')
+        df_volume, df_price = self._get_top_movers_data(to_day)
+        df_volume.to_excel(f'{path_volume}top_volume_{to_day}.xlsx')
+        df_price.to_excel(f'{path_price}top_price_{to_day}.xlsx')
+        print(f'Analysis completed in {time.time() - start_time:.2f} seconds')
+
+    def _get_top_movers_data(self, to_day):
+        df = select_stock('all', from_day, to_day)
+        df_volume = df.sort_values(by=['Volume', 'Close'], ascending=False).head(15)
+        df_price = df.sort_values(by=['Close', 'Volume'], ascending=False).head(15)
+        return df_volume, df_price
+		
+    def market_trend_analysis(self, date_list, market_type='kospi'):
+        start_time = time.time()
+        print(f'Starting market trend analysis for {market_type}')
+        for date in date_list:
+            market_data = select_market_period(market_type, date)
+            self._analyze_market_data(market_data, market_type, date)
+        print(f'Market trend analysis completed in {time.time() - start_time:.2f} seconds')
+
+    def _analyze_market_data(self, market_data, market_type, date):
+        # Analyze market data based on provided criteria
+        # Placeholder for analysis code
+        print(f"Analyzing {market_type} data for {date}")
+        # Placeholder for saving or plotting results
+		
+    def stock_performance_comparison(self, stock_list, start_date, end_date):
+        print("Comparing stock performances...")
+        combined_data = pd.DataFrame()
+        for stock in stock_list:
+            stock_data = select_stock(stock, start_date, end_date)
+            processed_data = self._process_stock_data(stock_data, stock)
+            combined_data = pd.concat([combined_data, processed_data], axis=1)
+        self._plot_combined_data(combined_data, "Stock Performance Comparison")
+        print("Comparison completed.")
+
+    def _process_stock_data(self, data, stock_name):
+        # Perform necessary processing on stock data
+        processed_data = data[['Close']]  # Placeholder for actual processing logic
+        processed_data.columns = [stock_name]
+        return processed_data
+
+    def _plot_combined_data(self, data, title):
+        # Plotting logic for combined data
+        data.plot(figsize=(15, 7))
+        plt.title(title)
+        plt.grid(True)
+        plt.show()
+		
+    def individual_stock_analysis(self, stock_name, start_date, end_date):
+        print(f"Analyzing stock: {stock_name}...")
+        stock_data = select_stock(stock_name, start_date, end_date)
+        processed_data = self._process_stock_data(stock_data)
+        self._plot_combined_data(processed_data, f"{stock_name} Stock Analysis")
+        print(f"Analysis of {stock_name} completed.")
+
+    def _process_stock_data(self, data):
+        # Perform necessary processing on stock data
+        processed_data = data[['Close']]  # Placeholder for actual processing logic
+        return processed_data
+		
+    def compare_sectors(self, sectors, start_date, end_date):
+        print("Comparing sectors...")
+        sector_data = {}
+        for sector in sectors:
+            sector_stock_data = self._collect_sector_data(sector, start_date, end_date)
+            sector_data[sector] = self._process_stock_data(sector_stock_data)
+        self._plot_sector_comparison(sector_data)
+        print("Sector comparison completed.")
+
+    def _collect_sector_data(self, sector, start_date, end_date):
+        # Placeholder logic for collecting sector-specific stock data
+        sector_stock_data = pd.DataFrame()  # Placeholder for actual data collection logic
+        return sector_stock_data
+
+    def _plot_sector_comparison(self, sector_data):
+        # Plotting logic for comparing sectors
+        pass  # Placeholder for actual plotting logic
+		
+    def analyze_market_trends(self, start_date, end_date):
+        print("Analyzing market trends...")
+        market_data = self._collect_market_data(start_date, end_date)
+        trend_analysis = self._identify_trends(market_data)
+        self._present_trend_analysis(trend_analysis)
+        print("Market trend analysis completed.")
+
+    def _collect_market_data(self, start_date, end_date):
+        # Logic for collecting market data over a specified period
+        market_data = pd.DataFrame()  # Placeholder for actual data collection
+        return market_data
+		
+class Report:
+    def __init__(self):
+        # Initialization code here (if needed)
+
+    def generate_market_report(self, market_type, start_date, end_date):
+        print(f"Generating market report for {market_type}...")
+        market_data = self._fetch_market_data(market_type, start_date, end_date)
+        market_analysis = self._analyze_market_data(market_data)
+        self._save_report(market_analysis, market_type)
+        print(f"Report for {market_type} generated successfully.")
+
+    def _fetch_market_data(self, market_type, start_date, end_date):
+        # Logic for fetching market data
+        market_data = pd.DataFrame()  # Placeholder for actual data fetching
+        return market_data
+
+    def _analyze_market_data(self, market_data):
+        # Logic for analyzing market data
+        analysis_results = {}  # Placeholder for market analysis logic
+        return analysis_results
+
+    def _save_report(self, analysis_results, market_type):
+        # Logic for saving the report
+        report_path = f'reports/{market_type}_report.xlsx'
+        analysis_results.to_excel(report_path)
+        print(f"Report saved at {report_path}")
+		
+
+
+				
+	
