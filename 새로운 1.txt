@@ -1,575 +1,112 @@
-# -*- coding: utf-8 -*-
-"""
-Spyder Editor
-This is a temporary script file.
-"""
-
-# 필요한 모듈 임포트
-import json
-import time
-import re
-import os
-import glob
-import shutil
-import io
-import sys
-import datetime as dt
+from mod1 import *
+from pykrx.stock import get_index_ohlcv_by_date
+import requests
+from pykrx.website.comm import webio
+import yfinance as yf
 from datetime import datetime, timedelta
-import pandas as pd
-import numpy as np
-from bs4 import BeautifulSoup
-import sqlalchemy
-import pymysql
-from urllib.request import urlopen
-import urllib.request as req
 
-# PlaidML 백엔드 설정
-import plaidml.keras
-plaidml.keras.install_backend()
+# ──────────────────────────────────────────────
+# pykrx webio 세션 설정 (KRX 로그인 권한 강화 대응)
+# Issue #276 참조: https://github.com/sharebook-kr/pykrx/issues/276
+# ──────────────────────────────────────────────
+_session = requests.Session()
 
-# Plotly 및 Matplotlib 설정
-import plotly.offline as offline
-import plotly.graph_objs as go
-from matplotlib import font_manager, rc
-from matplotlib import pyplot as plt
-plt.rcParams.update({'figure.max_open_warning': 0})
-plt.rcParams['axes.unicode_minus'] = False
-plt.rc('axes', unicode_minus=False)
-font_name = font_manager.FontProperties(fname="c:/Windows/Fonts/malgun.ttf").get_name()
-rc('font', family=font_name)
+def _session_post_read(self, **params):
+    return _session.post(self.url, headers=self.headers, data=params)
 
-# Keras 및 기타 ML 라이브러리
-from keras.models import Sequential
-from keras.layers import Dense, Activation, Dropout, LSTM
-from sklearn.preprocessing import MinMaxScaler
-import mplfinance as mpf
-import talib.abstract as ta
-from talib import RSI, BBANDS
+def _session_get_read(self, **params):
+    return _session.get(self.url, headers=self.headers, params=params)
 
-# 경고 관리
-import warnings
-warnings.simplefilter(action='ignore', category=FutureWarning)
-warnings.filterwarnings("ignore", category=RuntimeWarning) 
+webio.Post.read = _session_post_read
+webio.Get.read = _session_get_read
 
-# 날짜 관련 변수 설정
-today = datetime.now()
-str_yesterday = (today - timedelta(1)).strftime('%Y-%m-%d')
-str_today = today.strftime('%Y-%m-%d')
-three_period = ['day', 'week', 'month']
+# ──────────────────────────────────────────────
+# KRX 로그인 함수
+# ──────────────────────────────────────────────
+def login_krx(login_id: str, login_pw: str) -> bool:
+    """
+    KRX data.krx.co.kr 로그인 후 세션 쿠키(JSESSIONID)를 갱신합니다.
+    """
+    _LOGIN_PAGE = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd"
+    _LOGIN_JSP  = "https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp?site=mdc"
+    _LOGIN_URL  = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd"
+    _UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
 
-# MySQL 데이터베이스 연결 설정
-host = "localhost"
-port = 3306
-user = "root"
-password = "your_password"  # 이 부분은 환경 변수 또는 설정 파일로 대체하는 것을 권장합니다.
-database = "stock"
+    try:
+        # 초기 세션 발급
+        _session.get(_LOGIN_PAGE, headers={"User-Agent": _UA}, timeout=15)
+        _session.get(_LOGIN_JSP, headers={"User-Agent": _UA, "Referer": _LOGIN_PAGE}, timeout=15)
 
-# MySQL 데이터베이스 연결
-connection = pymysql.connect(host=host, port=port, user=user, password=password, database=database)
+        payload = {
+            "mbrNm": "", "telNo": "", "di": "", "certType": "",
+            "mbrId": login_id, "pw": login_pw,
+        }
+        headers = {
+            "User-Agent": _UA,
+            "Referer": _LOGIN_PAGE,
+            "X-Requested-With": "XMLHttpRequest"
+        }
 
-# SQLAlchemy 엔진 설정
-engine = sqlalchemy.create_engine(f'mysql+pymysql://{user}:{password}@{host}/{database}?charset=utf8', encoding='utf-8')
-conn = pymysql.connect(host=host, port=port, user=user, password=password, database=database)
-curs = conn.cursor()
+        # 로그인 POST
+        resp = _session.post(_LOGIN_URL, data=payload, headers=headers, timeout=15)
+        data = resp.json()
+        error_code = data.get("_error_code", "")
 
-# 삼성전자 마지막 날짜 조회
-stock_last_day = pd.read_sql("SELECT Date FROM market WHERE Name='삼성전자' ORDER BY Date DESC LIMIT 1", engine)
-stock_last_day['Date'] = pd.to_datetime(stock_last_day['Date']).dt.strftime('%Y-%m-%d')
-stock_last_day = stock_last_day['Date'].to_list()[0]
+        # CD011 중복 로그인 처리
+        if error_code == "CD011":
+            payload["skipDup"] = "Y"
+            resp = _session.post(_LOGIN_URL, data=payload, headers=headers, timeout=15)
+            data = resp.json()
+            error_code = data.get("_error_code", "")
 
-# 파일 경로 설정
-path_test = 'C:/Users/linux/OneDrive/stockdata/test_data/'
-path_down = 'C:/Users/linux/OneDrive/stockdata/period_down/'
-path_depress = 'C:/Users/linux/OneDrive/stockdata/depress/'
-path_depress_d = 'C:/Users/linux/OneDrive/stockdata/depress/depress_day_'
-path_depress_w = 'C:/Users/linux/OneDrive/stockdata/depress/depress_week_'
-path_depress_m = 'C:/Users/linux/OneDrive/stockdata/depress/depress_month_'
-path_vote_stock = 'C:/Users/linux/OneDrive/stockdata/vote_stock/'
-path_price = 'C:/Users/linux/OneDrive/stockdata/vote_stock/detect_stock_with_price_'
-path_volume = 'C:/Users/linux/OneDrive/stockdata/vote_stock/detect_stock_with_volume_'
-path_close_2008 = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_close_2008-01-01_'
-path_close_2019 = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_close_2019-01-01_'
-path_ma_2008 = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_ma_2008-01-01_'
-path_ma_2019 = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_ma_2019-01-01_'
-path_ma = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_ma_'
-path_close = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_close_'
-path_close_ma120 = 'C:/Users/linux/OneDrive/stockdata/close_ma120/'
-
-# 코스피 마지막 날짜 조회 및 처리
-kospi_final_day_df = pd.read_sql("SELECT Date FROM kospi ORDER BY Date DESC LIMIT 1", engine)
-final_day = kospi_final_day_df
-kospi_final_day_df = pd.to_datetime(kospi_final_day_df['Date'])
-kospi_next_day = kospi_final_day_df + timedelta(1)
-kospi_next_day_str = str(kospi_next_day)[4:14].replace('-', '')
-
-def compare_graph(path_name, day, from_day, subject, count=5):
-    name = pd.read_excel(path_name+day+'.xlsx')
-    name.columns = map(str.lower, name.columns)
-    name = name['name']
-    print('all:', name.shape[0])
-    name = name.iloc[count:count+5]
-    name = name.to_list()
-    
-    df1 = pd.DataFrame()
-
-    for x in  name:
-        df = select_stock(x, from_day)
-        df = df[['Date',subject]]
-        df.columns=['Date',x]
-        
-        if df1.empty:
-            df1 = df
-        elif df.empty:  ##  종목이 상장폐지되어 없어진것은 merge하지 않는다
-            pass
+        if error_code == "CD001":
+            print("✅ KRX 로그인 성공")
+            return True
         else:
-            df1 = pd.merge (df,df1,on='Date')
-    df1=df1.set_index('Date')
-    df1 = df1[df1.columns[::-1]]  ##  그래프 생성시 legend를 순서대로 나오게하기위해  columns를  재구성
-    name=df1.columns.tolist() ##  df에서  상장폐지되어 df1에 없어진 columnes를 수정하여 현행화한 name list
-    
-    plt.figure(figsize=(12,5))
-    for i in range(len(name)):
-        plt.plot(df1[name[i]]/df1[name[i]].iloc[0]*100)
-        plt.legend(name,loc=0)
-        plt.grid(True,color='0.7',linestyle=':',linewidth=2)
-
-def kospi_kosdaq(lastday='20251231', market='1001'):
-    if market == '1001':
-        df = get_index_ohlcv_by_date(kospi_next_day_no_hypyen, lastday, market)
-        df.index.names = ['Date']
-        df = df.iloc[:,[0,1,2,3,4]]
-        df.columns  = ['Open','High','Low','Close','Volume']
-        df['Market']='kospi'
-        df.to_sql(name='kospi', con=engine, if_exists='append')
-    elif market == '2001':
-        df = get_index_ohlcv_by_date(kospi_next_day_no_hypyen, lastday, market)
-        df.index.names = ['Date']
-        df = df.iloc[:,[0,1,2,3,4]]
-        df.columns  = ['Open','High','Low','Close','Volume']        
-        df['Market']='kosdaq'
-        df.to_sql(name='kosdaq', con=engine, if_exists='append')
-
-def compare_graph_with_name(name):
-    select_query = "select Date,Close,Volume from market where Name= "
-    date_query =  "Date >"
-    df_Close = pd.DataFrame()
-    df_Volume = pd.DataFrame()
-    dfc = pd.DataFrame()
-    dfv = pd.DataFrame()
-    #name=['엘아이에스']
-    date = '2020-01-01'
-
-    for x in name:
-        var = select_query +"'"+x+"'"+" "+"&&"+" "+date_query+"'"+date+"'"
-        df = pd.read_sql(var ,engine)
-        df_Close = df[['Date', 'Close']]
-        df_Close.columns=['Date',x]
-        df_Close = df_Close.set_index('Date')
-        dfc = pd.concat([dfc,df_Close], axis=1)
-        df_Volume = df[['Date', 'Volume']]
-        df_Volume.columns=['Date',x]
-        df_Volume = df_Volume.set_index('Date')
-        dfv = pd.concat([dfv,df_Volume], axis=1)
-
-    plt.figure(figsize=(16,5))
-
-    for i in range(len(name)):
-        plt.plot(dfc[name[i]]/dfc[name[i]].loc[df['Date'][0]]*100)
-        #plt.plot(dfv[name[i]]/dfv[name[i]].loc[df['Date'][0]]*100)        
-    plt.legend(name,loc=0)
-    plt.grid(True,color='0.7',linestyle=':',linewidth=1)
-    plt.figure(figsize=(16,5))
-    for i in range(len(name)):
-        #plt.plot(dfc[name[i]]/dfc[name[i]].loc[df['Date'][0]]*100)
-        plt.plot(dfv[name[i]]/dfv[name[i]].loc[df['Date'][0]]*100)        
-    plt.legend(name,loc=0)
-    plt.grid(True,color='0.7',linestyle=':',linewidth=1)
-
-def day_week_month_data(market='kospi', from_day='2020-01-01', to_day=str_today, period='month'):
-    """
-    주어진 시장의 데이터를 일/주/월 단위로 처리합니다.
-    """
-    if market=='kospi' or market=='kosdaq':
-        df = select_market_period(market, from_day)
-    else:
-        df = select_stock(market,from_day,to_day)
-
-	# 날짜 데이터 그룹화 및 처리
-	df['Date'] = pd.to_datetime(df['Date'])
-	months = [g for _, g in df.groupby(pd.Grouper(key='Date', freq='M'))]
-	weeks = [g for _, g in df.groupby(pd.Grouper(key='Date', freq='W'))]
-	columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
-	rows = []
-
-	# 월별, 주별, 일별 데이터 처리
-    if period == 'day':
-        nick = 'day'
-        df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-        df.columns = columns
-        #df = df.set_index(df['date'])
-        # return df
-    if period == 'month':
-        nick = 'month'
-        period = months
-    elif period == 'week':
-        nick = 'week'
-        period = weeks
-		
-	# 데이터 처리 루프
-	for i in range(len(period)):
-        try:
-            rows.append(period[i].iloc[-1]['Date'])
-            rows.append(period[i].iloc[0]["Open"])
-            rows.append(max(period[i]['High']))
-            rows.append(min(period[i]['Low']))
-            rows.append(period[i].iloc[-1]['Close'])
-            rows.append(sum(period[i]['Volume']))
+            print(f"❌ KRX 로그인 실패: {data.get('_error_message', error_code)}")
+            return False
     except Exception as e:
-        print(f"Error processing data: {e}")
+        print(f"❌ 로그인 중 오류 발생: {e}")
+        return False
 
-    arr = np.array(rows)
-
-	# 데이터 반환 조건
-	if nick == 'day':
-		return df
-
-	# 배열 재구성
-	if nick == 'week' and len(period) > 177:
-		arr1 = arr.reshape(len(period) - 1, 6)
-	else:
-		arr1 = arr.reshape(len(period), 6)
-
-	# 데이터프레임 생성
-	df = pd.DataFrame(data=arr1, columns=columns)
-
-	# 최종 데이터프레임 반환
-	return df
-
-def depress(period='day', to_day=str_today):
-    """
-    특정 기간에 대한 데이터 처리를 수행하는 함수.
-    """
-    path_depress = 'C:/Users/linux/OneDrive/stockdata/depress/depress_'
-    time_to_day = pd.to_datetime(to_day)
-    
-    # 기간에 따른 from_day 설정
-    if period == 'day':
-        from_day = (time_to_day - timedelta(days=60)).strftime('%Y-%m-%d')
-    elif period == 'week':
-        from_day = (time_to_day - timedelta(days=180)).strftime('%Y-%m-%d')
-    elif period == 'month':
-        from_day = (time_to_day - timedelta(days=365*2)).strftime('%Y-%m-%d')
-    else:
-        print("depress( ['day', 'week', 'month'] )")
-        return
-
-    # 주식 이름 선택 및 리스트 변환
-    df = select_stock('all', stock_last_day, stock_last_day)
-    name = df['Name'].to_list()
-
-    # 데이터 처리 루프
-    count = 0
-    depress_list = []
-    for stock_name in name:
-        df = day_week_month_data(market=stock_name, from_day=from_day, to_day=to_day, period=period)
-
-	# 주식 데이터 계산 및 처리
-	df['yesterday'] = df.Close.shift(1)
-	df['minus'] = (df['Close'] - df['yesterday']) < 0
-	df1 = df.sort_values(by=['Date'], axis=0, ascending=False, ignore_index=True)
-	minus = df1.minus.values
-
-	count = 0
-	depress_list = []
-	for i in minus:
-		if i:
-			count += 1
-		else:
-			break
-	depress_list.append(count)
-
-	# 데이터프레임 생성 및 저장
-	df2 = pd.DataFrame({'name': name, 'count': depress_list})
-	df3 = df2.sort_values(by=['count'], axis=0, ascending=False, ignore_index=True)
+# ──────────────────────────────────────────────
+# KRX 로그인 실행
+# ──────────────────────────────────────────────
+if login_krx("linux386", "leaf2027!"):
+    print("데이터 조회를 시작합니다...")
+else:
+    print("로그인 실패로 데이터 조회를 진행할 수 없습니다.")
 	
-	# 조건에 따른 데이터 처리
-    if period == 'month':
-        df3 = df3.iloc[:100]
-    elif period == 'week':
-        df3 = df3.iloc[:200]
-    elif period == 'day':
-        df3 = df3.iloc[:300]
-    else:
-        pass
-	df3.to_excel(path_depress + period + str_today + '.xlsx')
-
-def candle_graph(market='kospi', from_day='2020-01-01', period='week'):
-    """
-    주어진 시장과 기간에 대한 캔들 그래프를 생성하는 함수.
-    """
-    df = day_week_month_data(market, from_day, period)
-
-	# 캔들스틱 차트 데이터 준비
-	df = df[['Date', 'Open', 'High', 'Low', 'Close']]
-	offline.init_notebook_mode(connected=True)
-
-	# 캔들스틱 그래프 생성
-	trace = go.Candlestick(x=df.Date, open=df.Open, high=df.High, low=df.Low, close=df.Close, increasing_line_color='red', decreasing_line_color='blue')
-	data = [trace]
-	layout = go.Layout(title=market)
-	fig = go.Figure(data=data, layout=layout)
-	offline.iplot(fig, filename='candlestick')
-
-def bokeh_chart(market='kospi', from_day='2019-01-01', period='month'):
-    """
-    주어진 시장과 기간에 대한 Bokeh 차트를 생성하는 함수.
-    """
-    from math import pi
-    from bokeh.io import output_notebook, show
-    from bokeh.plotting import figure
-    from bokeh.layouts import gridplot
-    output_notebook()
-
-    # Bokeh 차트 데이터 준비
-    df = day_week_month_data(market, from_day, period)
-    df = df.set_index(df['Date'], drop=True)
-    df.rename(columns={'Date': 'Date1'}, inplace=True)  # Bokeh 차트에서 Date 인덱스 사용을 위해
-    mids = (df.Open + df.Close) / 2
-    spans = abs(df.Close - df.Open)
-    inc = df.Close >= df.Open
-    dec = df.Open > df.Close
-
-	# Bokeh 차트 설정 및 생성
-
-	TOOLS = "pan,wheel_zoom,box_zoom,reset,save,crosshair"
-
-	p_candlechart = figure(x_axis_type="datetime", tools=TOOLS, plot_width=900, plot_height=200, toolbar_location="left", title=market)
-	p_candlechart.xaxis.major_label_orientation = pi/4
-    p_candlechart.segment(df.index[inc], df.High[inc], df.index[inc], df.Low[inc], color="red")
-    p_candlechart.segment(df.index[dec], df.High[dec], df.index[dec], df.Low[dec], color="blue")
-    p_candlechart.vbar(df.index[inc], 0.5, df.Open[inc], df.Close[inc], fill_color="red", line_color="red",line_width=10)
-    p_candlechart.vbar(df.index[dec], 0.5, df.Open[dec], df.Close[dec], fill_color="blue", line_color="blue",line_width=10)
-
-	# 볼륨 차트 구성
-	p_volumechart = figure(x_axis_type="datetime", tools=TOOLS, plot_width=900, plot_height=200, toolbar_location="left")
-    p_volumechart.vbar(df.index, 0.5, df.Volume, fill_color="black", line_color="black",line_width=10)
 	
-	# 차트 표시
-    p = figure(tools='crosshair', plot_width=900, toolbar_location="left")
-    p = gridplot([[p_candlechart], [p_volumechart]], toolbar_location='left')	
-	show(p)
+	
+df_kosdaq = stock.get_market_fundamental("20260430",market="KOSDAQ")
+df_kospi = stock.get_market_fundamental("20260430",market="KOSPI")
+df_kosdaq = df_kosdaq.reset_index()
+df_kospi = df_kospi.reset_index()
 
-def bad_stock():
-    """
-    주식 관련 데이터를 수집하고 처리하는 함수.
-    """
-    # 데이터베이스 테이블 초기화 및 웹 스크래핑 로직
-    engine.execute("TRUNCATE TABLE badstock")
+df_market = pd.concat([df_kospi, df_kosdaq], ignore_index=True)
+df_market = df_market.rename(columns={'티커': 'Code'})
+df_market.sort_values('Code', ascending=True, inplace=True)
+print(df_market.head(2))	
+
+
+def fetch_market_data(date_str="2026-05-01"):
+    # Convert date format from YYYY-MM-DD to YYYYMMDD
+    date_formatted = date_str.replace("-", "")
     
-    url = 'https://finance.naver.com/sise/management.nhn'
-    source = urlopen(url).read()   # 지정한 페이지에서 코드 읽기
-    source = BeautifulSoup(source, 'lxml')   # 뷰티풀 스프로 태그별로 코드 분류
-    data = []
+    df_kosdaq = stock.get_market_fundamental(date_formatted, market="KOSDAQ")
+    df_kospi = stock.get_market_fundamental(date_formatted, market="KOSPI")
+    df_kosdaq = df_kosdaq.reset_index()
+    df_kospi = df_kospi.reset_index()
 
-	path = 'd:\\stockdata\\관리종목\\' + str_today + '.xlsx'
-	# 웹 스크래핑 및 데이터 처리
-    body = source.find('body')
-    trs = body.find_all('tr')
-    name = []
-    for tr in trs:
-        tds = tr.find_all('a',{'class':"tltle"})
-        for td in tds:
-            name.append(td.text.strip())
+    df_market = pd.concat([df_kospi, df_kosdaq], ignore_index=True)
+    df_market = df_market.rename(columns={'티커': 'Code'})
+    df_market['Date'] = date_str  # Add Date column with the passed date
+    print(df_market.head(2))
+    return df_market
 
-    df = pd.DataFrame(name)
-    df['Date']=str(str_today)
-    df = df.set_index('Date')
-    df.columns=['Name']
-    df.to_excel(path)
-    df = pd.read_excel(path)
-    df.to_sql(name='badstock', con=engine, if_exists='append', index = False)
-    return df
-
-def from_excel_analysis(path, file_day, from_date):
-    """
-    엑셀 파일에서 데이터를 읽고 분석하는 함수.
-    """
-    df = pd.read_excel(path + file_day + '.xlsx')
-    df.columns = map(str.lower, df.columns)  # 컬럼명 소문자로 변환
-    name = df['name'].to_list()
-    # 주식 데이터 분석 로직
-    name=df.to_list()
-    for i in name:
-        df=select_stock(i,from_date,)
-        close_ma_vol(df, 'ma60')
-
-def last_page(source):
-    """
-    웹 페이지의 마지막 페이지 번호를 찾는 함수.
-    """
-    last = source.find('td', class_='pgRR').find('a')['href']
-    last = int(last.split('page')[1].split('=')[1])
-    return last
-
-def select_market_at(name, at_date):
-    """
-    특정 날짜의 시장 데이터를 조회하는 함수.
-    """
-    select_query = "select * from "
-    date_query = " where Date = "    
-    df = pd.read_sql(select_query + name + date_query + "'" + at_date + "'", engine)
-    return df
-
-def select_market_period(name, from_date):
-    """
-    특정 기간의 시장 데이터를 조회하는 함수.
-    """
-    select_query = "select * from "
-    date_query = " where Date >= "    
-    df = pd.read_sql(select_query + name + date_query + "'" + from_date + "'", engine)
-    return df
-
-def select_stock(name, from_date, to_date=str_today):
-    """
-    특정 주식 또는 모든 주식에 대한 데이터를 선택하는 함수.
-    """
-    select_query = "select * from market where Name=" + ("'*'" if name == 'all' else "'" + name + "'") + " and Date >= '" + from_date + "' and Date <= '" + to_date + "'"
-    df = pd.read_sql(select_query, engine)
-    return df
-
-def make_name_list(path_name=path_depress, arg="*day*.*", num=0, degree=30):
-    """
-    특정 경로에서 파일을 검색하고 주식 이름 목록을 생성하는 함수.
-    """
-    files = glob.glob(os.path.join(path_name, arg))
-    try:
-        aa = re.findall('\d+', files[num])
-        bb = [aa[0] + '-' + aa[1] + '-' + aa[2]]
-        df = pd.read_excel(files[num], index_col=0)
-        name = df['Name'][:degree] if len(df) > 50 else df['Name']
-        name = name.tolist()
-        print(bb)
-    except Exception as e:
-        print(f"Error: {e}")
-        name = []
-    return name
-
-def min_max(df, select):
-    """
-    주식 데이터에 대한 최소-최대 정규화를 수행하는 함수.
-    """
-    df.columns = df.columns.str.lower()
-    ma(df)
-    source = MinMaxScaler()
-    data = source.fit_transform(df[['close', select, 'volume']].values)
-    df1 = pd.DataFrame(data, columns=['close', select, 'volume'], index=df.index)
-    return df1
-
-def ma(DataFrame):
-    """
-    주어진 데이터프레임에 대해 여러 이동 평균을 계산하는 함수.
-    """
-    try:
-        df = DataFrame.copy()
-        df.columns = df.columns.str.lower()
-        df[['volume', 'close']] = df[['volume', 'close']].astype(float)  # TA-Lib 계산을 위해 실수 타입으로 변환
-
-        # 여러 이동 평균 계산
-        df['ma5'] = ta.MA(df, timeperiod=5)
-        df['ma10'] = ta.MA(df, timeperiod=10)
-        df['ma15'] = ta.MA(df, timeperiod=15)
-        df['ma20'] = ta.MA(df, timeperiod=20)
-		df['ma30'] = ta.MA(df, timeperiod=30)
-		df['ma60'] = ta.MA(df, timeperiod=60)
-		df['ma120'] = ta.MA(df, timeperiod=120)		
-		
-    except Exception as e:
-        print(f"Error in MA calculation: {e}")
-    return df
-
-
-
-# 다양한 그래프 생성 함수들
-def stock_volume_graph(name, date_list):
-    for i in name:
-        for j in date_list:
-            df = select_stock(i, j,)
-            close_ma_vol(df,'ma60','ma120','volume')
-
-def stock_close_graph(name, date_list):
-    for i in name:
-        for j in date_list:
-            df = select_stock(i, j,)
-            close_ma(df,'ma60','ma120')
-
-def market_volume_graph(name, date_list):
-    for i in name:
-        for j in date_list:
-            df = select_market(i, j,)
-            market_ma_vol(df,'ma60','ma120','volume')
-
-def market_close_graph(name, date_list):
-    for i in name:
-        for j in date_list:
-            df = select_market_period(i, j)
-            market_ma(df,'ma60','ma120') 
-
-# close_ma 함수
-def close_ma(df, select1='ma60', select2='ma120'):
-    """
-    주어진 데이터프레임에 대해 이동 평균 및 종가 데이터를 시각화하는 함수.
-    """
-    ma(df)
-    source = MinMaxScaler()
-    data = source.fit_transform(df[['close', select1, select2]].values)
-    df1 = pd.DataFrame(data, columns=['close', select1, select2], index=df.index)
-    df1.plot(figsize=(16, 4))
-    plt.title(df['name'][0])
-    plt.grid(True)
-    plt.show()
-
-def close_ma_vol(df, select1='ma60', select2='ma120', select3='volume'):
-    """
-    주어진 데이터프레임에 대해 이동 평균, 종가, 거래량 데이터를 시각화하는 함수.
-    """
-    try:
-        ma(df)
-        # 데이터 정규화 및 시각화
-        source = MinMaxScaler()
-        data = source.fit_transform(df[['close', select1, select2, select3]].values)
-        df1 = pd.DataFrame(data, columns=['close', select1, select2, select3], index=df.index)
-        df1.plot(figsize=(16, 4))
-        plt.title(df['name'][0])
-        plt.grid(True)
-        plt.show()
-    except Exception as e:
-        print(f"Error in close_ma_vol: {e}")
-
-def market_ma(df, select1, select2):
-    """
-    시장 데이터에 대한 이동 평균을 계산하는 함수.
-    """
-    ma(df)
-    # 데이터 정규화 및 시각화
-    source = MinMaxScaler()
-    data = source.fit_transform(df[['close', select1, select2]].values)
-    df1 = pd.DataFrame(data, columns=['close', select1, select2], index=df.index)
-    df1.plot(figsize=(16, 4))
-    plt.title(df['market'][0])
-    plt.grid(True)
-    plt.show()
-
-def market_ma_vol(df, select1, select2, select3):
-    """
-    시장 데이터에 대한 이동 평균 및 거래량을 계산하는 함수.
-    """
-    ma(df)
-    # 데이터 정규화 및 시각화
-    source = MinMaxScaler()
-    data = source.fit_transform(df[['close', select1, select2, select3]].values)
-    df1 = pd.DataFrame(data, columns=['close', select1, select2, select3], index=df.index)
-    df1.plot(figsize=(16, 4))
-    plt.title(df['market'][0])
-    plt.grid(True)
-    plt.show()
-
+# Call the function with the date parameter
+df_market = fetch_market_data("2026-05-01")
