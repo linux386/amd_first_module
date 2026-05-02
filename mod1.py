@@ -180,6 +180,58 @@ if engine is not None:
         kospi_next_day_no_hypyen = kospi_next_df.replace('-','')   ## 20200713
     except Exception as e:
         print(f"Warning: could not load kospi final day from database: {e}")
+        
+def login_krx(login_id: str, login_pw: str) -> bool:
+    """
+    KRX data.krx.co.kr 로그인 후 세션 쿠키(JSESSIONID)를 갱신합니다.
+    if login_krx("linux386", "leaf2027!")
+    """
+    _LOGIN_PAGE = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd"
+    _LOGIN_JSP  = "https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp?site=mdc"
+    _LOGIN_URL  = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd"
+    _UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+
+    try:
+        # 초기 세션 발급
+        _session.get(_LOGIN_PAGE, headers={"User-Agent": _UA}, timeout=15)
+        _session.get(_LOGIN_JSP, headers={"User-Agent": _UA, "Referer": _LOGIN_PAGE}, timeout=15)
+
+        payload = {
+            "mbrNm": "", "telNo": "", "di": "", "certType": "",
+            "mbrId": login_id, "pw": login_pw,
+        }
+        headers = {
+            "User-Agent": _UA,
+            "Referer": _LOGIN_PAGE,
+            "X-Requested-With": "XMLHttpRequest"
+        }
+
+        # 로그인 POST
+        resp = _session.post(_LOGIN_URL, data=payload, headers=headers, timeout=15)
+        data = resp.json()
+        error_code = data.get("_error_code", "")
+
+        # CD011 중복 로그인 처리
+        if error_code == "CD011":
+            payload["skipDup"] = "Y"
+            resp = _session.post(_LOGIN_URL, data=payload, headers=headers, timeout=15)
+            data = resp.json()
+            error_code = data.get("_error_code", "")
+
+        if error_code == "CD001":
+            print("✅ KRX 로그인 성공")
+            return True
+        else:
+            print(f"❌ KRX 로그인 실패: {data.get('_error_message', error_code)}")
+            return False
+    except Exception as e:
+        print(f"❌ 로그인 중 오류 발생: {e}")
+        return False        
+        
+        
 def compare_graph(path_name, day,from_day, subject, count=5):
     name = pd.read_excel(path_name+day+'.xlsx')
     name.columns = map(str.lower, name.columns)
