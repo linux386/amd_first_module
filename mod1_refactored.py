@@ -1386,6 +1386,176 @@ class to_sql:
             }
         return results
 
+    def update_krx_daily_features(self, end_date=None, start_date=None, max_dates=1, sleep_sec=0.1):
+        """Incrementally store per-ticker KRX market-cap/flow/short/foreign features.
+
+        The first run stores the latest available trading date only. Pass
+        ``start_date`` and a larger ``max_dates`` for controlled backfill.
+        Optional KRX endpoints may be absent; those columns remain NULL.
+        """
+        import time as _time
+
+        if stock is None:
+            raise ImportError('Install pykrx to collect KRX daily features.')
+        if max_dates < 1:
+            raise ValueError('max_dates must be at least 1')
+        eng = _require_engine()
+
+        if end_date is None:
+            market_max = pd.read_sql_query(
+                text('SELECT MAX(`Date`) AS max_date FROM `market`'), eng
+            )
+            if market_max.empty or pd.isna(market_max.iloc[0]['max_date']):
+                raise RuntimeError('market 테이블에서 최신 거래일을 찾을 수 없습니다.')
+            end_day = pd.Timestamp(market_max.iloc[0]['max_date']).date()
+        else:
+            end_day = pd.Timestamp(end_date).date()
+
+        feature_max = pd.read_sql_query(
+            text('SELECT MAX(`trade_date`) AS max_date FROM `limitup_krx_daily_features`'), eng
+        )
+        last_feature_day = feature_max.iloc[0]['max_date'] if not feature_max.empty else None
+        if start_date is not None:
+            begin_day = pd.Timestamp(start_date).date()
+        elif last_feature_day is None:
+            begin_day = end_day  # Avoid an unrequested multi-decade download on first run.
+        else:
+            begin_day = pd.Timestamp(last_feature_day).date() + dt.timedelta(days=1)
+        if begin_day > end_day:
+            return {'dates': 0, 'rows': 0, 'status': 'already_current'}
+
+        calendar = pd.read_sql_query(
+            text('SELECT `Date` FROM `kospi` WHERE `Market`=:market '
+                 'AND `Date`>=:start_date AND `Date`<=:end_date ORDER BY `Date`'),
+            eng,
+            params={'market': 'kospi', 'start_date': begin_day, 'end_date': end_day},
+        )
+        trading_dates = [pd.Timestamp(value).date() for value in calendar['Date'].tolist()]
+        if not trading_dates and begin_day == end_day:
+            trading_dates = [end_day]
+        trading_dates = trading_dates[:max_dates]
+        print(f'KRX feature dates queued: {len(trading_dates)} ({begin_day} ~ {end_day})')
+
+        def norm_index(frame):
+            copy = frame.copy()
+            copy.index = pd.Index([str(value).strip().zfill(6) for value in copy.index], name='code')
+            return copy
+
+        def pick_column(frame, tokens):
+            if frame is None or frame.empty:
+                return None
+            for column in frame.columns:
+                label = str(column).strip().lower()
+                if all(token.lower() in label for token in tokens):
+                    return column
+            return None
+
+        def align_series(frame, column):
+            if frame is None or column is None or frame.empty:
+                return None
+            result = frame[column].copy()
+            result.index = pd.Index([str(value).strip().zfill(6) for value in result.index], name='code')
+            return pd.to_numeric(result, errors='coerce')
+
+        rows_written = 0
+        date_results = []
+        for trade_day in trading_dates:
+            day_key = trade_day.strftime('%Y%m%d')
+            daily_frames = []
+            market_errors = []
+            for market_name in ('KOSPI', 'KOSDAQ'):
+                try:
+                    cap = stock.get_market_cap_by_ticker(day_key, market=market_name)
+                    if cap is None or cap.empty:
+                        raise ValueError('market-cap endpoint returned no rows')
+                    cap = norm_index(cap)
+                    market_frame = pd.DataFrame(index=cap.index)
+                    market_frame['market'] = market_name
+                    market_frame['market_cap'] = align_series(cap, pick_column(cap, ('시가총액',)))
+                    market_frame['trading_value'] = align_series(cap, pick_column(cap, ('거래대금',)))
+
+                    # Optional enrichments: keep the row and leave fields NULL if an endpoint fails.
+                    try:
+                        short = stock.get_shorting_volume_by_ticker(day_key, market=market_name)
+                        if isinstance(short, pd.Series):
+                            short_frame = short.to_frame()
+                            short_frame = norm_index(short_frame)
+                            short_column = short_frame.columns[0]
+                        else:
+                            short_frame = norm_index(short)
+                            short_column = pick_column(short_frame, ('거래량',)) or pick_column(short_frame, ('공매도',))
+                        market_frame['short_volume'] = align_series(short_frame, short_column)
+                    except Exception as exc:
+                        logger.warning('%s short-volume fetch failed for %s: %s', market_name, day_key, exc)
+
+                    try:
+                        foreign = stock.get_exhaustion_rates_of_foreign_investment_by_ticker(
+                            day_key, market=market_name
+                        )
+                        foreign = norm_index(foreign)
+                        foreign_column = pick_column(foreign, ('지분율',))
+                        market_frame['foreign_ownership_pct'] = align_series(foreign, foreign_column)
+                    except Exception as exc:
+                        logger.warning('%s foreign-ownership fetch failed for %s: %s', market_name, day_key, exc)
+
+                    flow_api = getattr(stock, 'get_market_net_purchases_of_equities_by_ticker', None)
+                    if flow_api is None:
+                        flow_api = getattr(stock, 'get_market_trading_value_and_volume_by_ticker', None)
+                    for investor, output_column in (
+                        ('외국인', 'foreign_net_volume'),
+                        ('기관합계', 'institution_net_volume'),
+                        ('개인', 'individual_net_volume'),
+                    ):
+                        try:
+                            flow = flow_api(day_key, day_key, market_name, investor=investor) if flow_api else None
+                            if flow is not None and not flow.empty:
+                                flow = norm_index(flow)
+                                flow_column = pick_column(flow, ('순매수', '거래량'))
+                                market_frame[output_column] = align_series(flow, flow_column)
+                        except Exception as exc:
+                            logger.warning('%s %s flow fetch failed for %s: %s', market_name, investor, day_key, exc)
+
+                    market_frame['trade_date'] = trade_day
+                    market_frame['code'] = market_frame.index.astype(str)
+                    market_frame['official_upper_limit_price'] = None
+                    market_frame['source'] = 'pykrx'
+                    columns = [
+                        'trade_date', 'code', 'market', 'market_cap', 'trading_value',
+                        'foreign_net_volume', 'institution_net_volume', 'individual_net_volume',
+                        'short_volume', 'foreign_ownership_pct', 'official_upper_limit_price', 'source',
+                    ]
+                    for optional_column in columns:
+                        if optional_column not in market_frame.columns:
+                            market_frame[optional_column] = None
+                    daily_frames.append(market_frame[columns].reset_index(drop=True))
+                except Exception as exc:
+                    market_errors.append((market_name, str(exc)[:180]))
+                _time.sleep(sleep_sec)
+
+            if market_errors:
+                date_results.append({'date': trade_day.isoformat(), 'status': 'skipped', 'errors': market_errors})
+                print(f'{day_key}: skipped because a required KRX market snapshot failed: {market_errors}')
+                continue
+            if not daily_frames:
+                date_results.append({'date': trade_day.isoformat(), 'status': 'no_data', 'rows': 0})
+                continue
+
+            complete_day = pd.concat(daily_frames, ignore_index=True)
+            with eng.begin() as transaction:
+                transaction.execute(
+                    text('DELETE FROM `limitup_krx_daily_features` WHERE `trade_date`=:trade_date'),
+                    {'trade_date': trade_day},
+                )
+                complete_day.to_sql(
+                    'limitup_krx_daily_features', con=transaction,
+                    if_exists='append', index=False, chunksize=2000,
+                )
+            rows_written += len(complete_day)
+            date_results.append({'date': trade_day.isoformat(), 'status': 'written', 'rows': len(complete_day)})
+            print(f'{day_key}: wrote {len(complete_day):,} per-stock KRX feature rows')
+
+        return {'dates': len(trading_dates), 'rows': rows_written, 'results': date_results}
+
 
 class to_excel:
     investor_trend_url = 'http://finance.naver.com/sise/investorDealTrendDay.nhn?bizdate=20220601&sosok=&page='
