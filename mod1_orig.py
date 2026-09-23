@@ -7,28 +7,56 @@ This is a temporary script file.
 import json
 import time
 import re
-import plaidml.keras
-plaidml.keras.install_backend()
+import requests
 import plotly.offline as offline
 import plotly.graph_objs as go
 import os,glob,shutil,io,sys
-from pykrx.stock.api import *
-from fake_useragent import UserAgent
-ua = UserAgent(browsers=['edge', 'chrome'])
-ua.random
-import FinanceDataReader as fdr
+
+# Optional dependency: pykrx (KRX 데이터 다운로드)
+try:
+    from pykrx import stock
+    from pykrx import bond
+    from pykrx.stock import get_index_ohlcv_by_date
+except ImportError:
+    stock = None
+    bond = None
+    get_index_ohlcv_by_date = None
+    print("Warning: pykrx is not installed. Some functions will not work.")
+
+# Optional dependency: fake_useragent (웹 스크래핑용 랜덤 User-Agent)
+try:
+    from fake_useragent import UserAgent
+    ua = UserAgent(browsers=['edge', 'chrome'])
+    ua.random
+except ImportError:
+    UserAgent = None
+    ua = None
+    print("Warning: fake_useragent is not installed. Some functions may not work as expected.")
+
+try:
+    import FinanceDataReader as fdr
+except ImportError:
+    fdr = None
+    print("Warning: FinanceDataReader is not installed. Some functions will not work.")
+
 import pandas as pd
 import numpy as np
-from bs4 import BeautifulSoup
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+    print("Warning: bs4 is not installed. Some web scraping functions will not work.")
 import datetime as dt
-from keras.models import Sequential
-from keras.layers import Dense, Activation, Dropout,LSTM
-from sklearn.preprocessing import MinMaxScaler
+#from keras.models import Sequential
+#from keras.layers import Dense, Activation, Dropout,LSTM
+#from sklearn.preprocessing import MinMaxScaler
+import atexit
 from datetime import datetime,timedelta
 from urllib.request import urlopen
 import urllib.request as req
 import sqlalchemy 
 import pymysql
+import pyodbc
 from matplotlib import font_manager, rc
 from matplotlib import pyplot as plt
 plt.rcParams.update({'figure.max_open_warning': 0})
@@ -36,9 +64,9 @@ plt.rcParams['axes.unicode_minus'] = False
 plt.rc('axes', unicode_minus=False)
 font_name = font_manager.FontProperties(fname="c:/Windows/Fonts/malgun.ttf").get_name()
 rc('font', family=font_name)
-import mplfinance as mpf
-import talib.abstract as ta
-from talib import RSI, BBANDS
+#import mplfinance as mpf
+#import talib.abstract as ta
+#from talib import RSI, BBANDS
 
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -62,18 +90,64 @@ user = "root"
 password = "leaf2027"
 database = "stock"
 
-# Connect to MySQL
-connection = pymysql.connect(host=host, port=port, user=user, password=password, database=database)
+# Connect to MySQL (optional)
+connection = None
+conn = None
+curs = None
+engine = None
+stock_last_day = str_today
 
-#now = dt.datetime.today().strftime('%Y-%m-%d')
-engine = sqlalchemy.create_engine('mysql+pymysql://root:leaf2027@localhost/stock?charset=utf8',encoding='utf-8')
-conn = pymysql.connect(host=host, port=port, user=user, password=password, database=database)
-curs = conn.cursor()
+try:
+    connection = pymysql.connect(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        connect_timeout=5,
+    )
+    conn = pymysql.connect(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        connect_timeout=5,
+    )
+    curs = conn.cursor()
+    engine = sqlalchemy.create_engine(
+        'mysql+pymysql://root:leaf2027@localhost/stock?charset=utf8',
+        connect_args={'connect_timeout': 5},
+        pool_pre_ping=True,
+    )
 
-stock_last_day = pd.read_sql("select Date from market where Name='삼성전자' order by Date desc limit 1",engine)
-stock_last_day['Date'] = pd.to_datetime(stock_last_day['Date']).dt.strftime('%Y-%m-%d')
-stock_last_day = stock_last_day['Date'].to_list()[0]
-stock_last_day
+    stock_last_day_df = pd.read_sql(
+        "select Date from market where Name='삼성전자' order by Date desc limit 1",
+        engine,
+    )
+    stock_last_day_df['Date'] = pd.to_datetime(stock_last_day_df['Date']).dt.strftime('%Y-%m-%d')
+    stock_last_day = stock_last_day_df['Date'].to_list()[0]
+except Exception as e:
+    print(f"Warning: could not connect to MySQL or query stock dates: {e}")
+    connection = None
+    conn = None
+    curs = None
+    engine = None
+    # Keep defaults; functions that require a database connection should check engine/conn and handle None.
+
+
+def _close_db_connections():
+    global connection, conn
+    for c in (connection, conn):
+        try:
+            if c is not None:
+                c.close()
+        except Exception:
+            pass
+    connection = None
+    conn = None
+
+atexit.register(_close_db_connections)
 
 path_test = 'C:/Users/linux/OneDrive/stockdata/test_data/'
 path_down = 'C:/Users/linux/OneDrive/stockdata/period_down/'
@@ -92,14 +166,72 @@ path_ma = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_ma_'
 path_close = 'C:/Users/linux/OneDrive/stockdata/close_ma120/total_close_'
 path_close_ma120 = 'C:/Users/linux/OneDrive/stockdata/close_ma120/'
 
-kospi_final_day_df = pd.read_sql("select Date from kospi order by Date desc limit 1", engine)
-final_day = kospi_final_day_df
-kospi_final_day_df = pd.to_datetime(kospi_final_day_df['Date'])
-kospi_next_df = kospi_final_day_df + timedelta(1) ##  최종날짜 다음날짜
-kospi_next_df = str(kospi_next_df)
-kospi_next_df = kospi_next_df[4:14]                ## 2020-07-13
-kospi_next_day_no_hypyen = kospi_next_df.replace('-','')   ## 20200713
+kospi_next_day_no_hypyen = (today + timedelta(1)).strftime('%Y%m%d')
+final_day = pd.DataFrame({'Date': [str_today]})
 
+if engine is not None:
+    try:
+        kospi_final_day_df = pd.read_sql("select Date from kospi order by Date desc limit 1", engine)
+        final_day = kospi_final_day_df
+        kospi_final_day_df = pd.to_datetime(kospi_final_day_df['Date'])
+        kospi_next_df = kospi_final_day_df + timedelta(1)  ##  최종날짜 다음날짜
+        kospi_next_df = str(kospi_next_df)
+        kospi_next_df = kospi_next_df[4:14]                ## 2020-07-13
+        kospi_next_day_no_hypyen = kospi_next_df.replace('-','')   ## 20200713
+    except Exception as e:
+        print(f"Warning: could not load kospi final day from database: {e}")
+        
+def login_krx(login_id: str, login_pw: str) -> bool:
+    """
+    KRX data.krx.co.kr 로그인 후 세션 쿠키(JSESSIONID)를 갱신합니다.
+    if login_krx("linux386", "leaf2027!")
+    """
+    _LOGIN_PAGE = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd"
+    _LOGIN_JSP  = "https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp?site=mdc"
+    _LOGIN_URL  = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd"
+    _UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+
+    try:
+        # 초기 세션 발급
+        _session.get(_LOGIN_PAGE, headers={"User-Agent": _UA}, timeout=15)
+        _session.get(_LOGIN_JSP, headers={"User-Agent": _UA, "Referer": _LOGIN_PAGE}, timeout=15)
+
+        payload = {
+            "mbrNm": "", "telNo": "", "di": "", "certType": "",
+            "mbrId": login_id, "pw": login_pw,
+        }
+        headers = {
+            "User-Agent": _UA,
+            "Referer": _LOGIN_PAGE,
+            "X-Requested-With": "XMLHttpRequest"
+        }
+
+        # 로그인 POST
+        resp = _session.post(_LOGIN_URL, data=payload, headers=headers, timeout=15)
+        data = resp.json()
+        error_code = data.get("_error_code", "")
+
+        # CD011 중복 로그인 처리
+        if error_code == "CD011":
+            payload["skipDup"] = "Y"
+            resp = _session.post(_LOGIN_URL, data=payload, headers=headers, timeout=15)
+            data = resp.json()
+            error_code = data.get("_error_code", "")
+
+        if error_code == "CD001":
+            print("✅ KRX 로그인 성공")
+            return True
+        else:
+            print(f"❌ KRX 로그인 실패: {data.get('_error_message', error_code)}")
+            return False
+    except Exception as e:
+        print(f"❌ 로그인 중 오류 발생: {e}")
+        return False        
+        
+        
 def compare_graph(path_name, day,from_day, subject, count=5):
     name = pd.read_excel(path_name+day+'.xlsx')
     name.columns = map(str.lower, name.columns)
@@ -131,21 +263,22 @@ def compare_graph(path_name, day,from_day, subject, count=5):
         plt.legend(name,loc=0)
         plt.grid(True,color='0.7',linestyle=':',linewidth=2)
 
-def kospi_kosdaq(lastday='20251231', market='1001'):
+def kospi_kosdaq(start_date, lastday='20251231', market='1001'):
     if market == '1001':
-        df = get_index_ohlcv_by_date(kospi_next_day_no_hypyen, lastday, market)
+        df = stock.get_index_ohlcv_by_date(start_date, lastday, market)
         df.index.names = ['Date']
         df = df.iloc[:,[0,1,2,3,4]]
         df.columns  = ['Open','High','Low','Close','Volume']
         df['Market']='kospi'
         df.to_sql(name='kospi', con=engine, if_exists='append')
     elif market == '2001':
-        df = get_index_ohlcv_by_date(kospi_next_day_no_hypyen, lastday, market)
+        df = stock.get_index_ohlcv_by_date(start_date, lastday, market)
         df.index.names = ['Date']
         df = df.iloc[:,[0,1,2,3,4]]
         df.columns  = ['Open','High','Low','Close','Volume']        
         df['Market']='kosdaq'
         df.to_sql(name='kosdaq', con=engine, if_exists='append')
+
     #kospi_kosdaq( market='코스피')
 
 def compare_graph_with_name(name):
@@ -184,58 +317,36 @@ def compare_graph_with_name(name):
     plt.legend(name,loc=0)
     plt.grid(True,color='0.7',linestyle=':',linewidth=1)
     
-def day_week_month_data(market='kospi', from_day = '2020-01-01', to_day = str_today, period ='month'):
-    if market=='kospi' or market=='kosdaq':
-        df = select_market_period(market, from_day)
-    else:
-        df = select_stock(market,from_day,to_day)
-
+def aggregate_data(df, freq):
     df['Date'] = pd.to_datetime(df['Date'])
-    months = [g for n, g in df.groupby(pd.Grouper(key='Date', freq='M'))]  # 월별
-    weeks = [g for n, g in df.groupby(pd.Grouper(key='Date', freq='W'))]  # 주별
-    columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
-    rows = []
+    grouped = df.groupby(pd.Grouper(key='Date', freq=freq))
+
+    aggregated_data = []
+    for _, group in grouped:
+        if not group.empty:
+            aggregated_data.append([
+                group.iloc[-1]['Date'],
+                group.iloc[0]['Open'],
+                max(group['High']),
+                min(group['Low']),
+                group.iloc[-1]['Close'],
+                sum(group['Volume'])
+            ])
+
+    return pd.DataFrame(aggregated_data, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
+
+def day_week_month_data(market='kospi', from_day='2020-01-01', to_day='2024-01-01', period='month'):
+    if market in ['kospi', 'kosdaq']:
+        df = select_market_period(market, from_day, to_day)  # 함수 구현 필요
+    else:
+        df = select_stock(market, from_day, to_day)  # 함수 구현 필요
 
     if period == 'day':
-        nick = 'day'
-        df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-        df.columns = columns
-        #df = df.set_index(df['date'])
-        # return df
-    if period == 'month':
-        nick = 'month'
-        period = months
+        return df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+    elif period == 'month':
+        return aggregate_data(df, 'M')
     elif period == 'week':
-        nick = 'week'
-        period = weeks
-
-    for i in range(len(period)):
-        try:
-            rows.append(period[i].iloc[-1]['Date'])
-            rows.append(period[i].iloc[0]["Open"])
-            rows.append(max(period[i]['High']))
-            rows.append(min(period[i]['Low']))
-            rows.append(period[i].iloc[-1]['Close'])
-            rows.append(sum(period[i]['Volume']))
-        except:
-            pass
-
-    #print('count:', len(period))
-    arr = np.array(rows)
-							  
-    if nick == 'day':
-        return df
-
-    if nick == 'week' and len(period) > 177:
-        #arr1 = arr.reshape(len(period)-1,6)
-        arr1 = arr.reshape(len(period)-1, 6)
-
-    else:
-        arr1 = arr.reshape(len(period), 6)
-
-    df = pd.DataFrame(data=arr1, columns=columns)
-
-    return df    
+        return aggregate_data(df, 'W')
 
 def depress(period='day', to_day=str_today):
     
@@ -302,8 +413,8 @@ def depress(period='day', to_day=str_today):
     df3 = df3.rename(columns={'name': 'Name'})
     df3.to_excel(path_depress+period+str_today+'.xlsx')
     
-def candle_graph( market='kospi', from_day = '2020-01-01',period ='week' ):
-    df = day_week_month_data(market, from_day ,period )
+def candle_graph(market='kospi', from_day='2020-01-01', to_day=str_today, period='week'):
+    df = day_week_month_data(market, from_day, to_day, period)
 
     df = df[['Date','Open','High','Low','Close']]
     
@@ -316,7 +427,7 @@ def candle_graph( market='kospi', from_day = '2020-01-01',period ='week' ):
     fig = go.Figure(data=data, layout=layout)
     offline.iplot(fig,filename='candlestick')
     
-def bokeh_chart(market='kospi',from_day = '2019-01-01', period ='month'):
+def bokeh_chart(market='kospi', from_day='2019-01-01', to_day=str_today, period='month'):
     from math import pi
     from bokeh.io import output_notebook, show
     from bokeh.plotting import figure
@@ -324,7 +435,7 @@ def bokeh_chart(market='kospi',from_day = '2019-01-01', period ='month'):
 
     output_notebook()
     
-    df = day_week_month_data(market, from_day, period)
+    df = day_week_month_data(market, from_day, to_day, period)
     df = df.set_index(df['Date'], drop=True)
     df.rename(columns = {'Date' : 'Date1'}, inplace = True)  ##  Bokeh_Chart에서 Date index를사용하기위해 Colume명 Date를 Date1으로변경    
     mids = (df.Open + df.Close)/2
@@ -402,12 +513,19 @@ def select_market_at(name,at_date):   ###  name='kospi' or 'kosdaq'
     df = pd.read_sql(var, engine)
     return df
 
-def select_market_period(name,from_date):   ###  name='kospi' or 'kosdaq'
+def select_market_period(name, from_date, to_date=None):   ###  name='kospi' or 'kosdaq'
     select_query = "select * from "
     date_query = " where Date >= "    
-    var = select_query + name + date_query+"'"+from_date+"'" 
+    var = select_query + name + date_query + "'" + from_date + "'"
+    if to_date:
+        var += " and Date <= '" + to_date + "'"
     df = pd.read_sql(var, engine)
     return df
+
+
+def select_market(name, from_date, to_date=str_today):
+    """Wrapper around select_market_period for compatibility with older code."""
+    return select_market_period(name, from_date, to_date)
 
 def select_stock(name, from_date, to_date=str_today):
     ''' name : 'all'(모든주식),  'hrs'(주식이름이 'hrs'),  from_date : 시작날짜,  to_date : 마지막날짜) '''
@@ -428,9 +546,9 @@ def make_name_list(path_name=path_depress, arg = "*day*.*" , num=0, degree=30):
     files = glob.glob(os.path.join(path_name , arg))
 
     try:
-        aa = re.findall('\d+',files[num])
+        aa = re.findall(r'\d+', files[num])
         bb=[aa[0]+'-'+aa[1]+'-'+aa[2] ]
-    except:
+    except Exception:
         pass
     df = pd.read_excel(files[num], index_col=0)
     
@@ -547,6 +665,49 @@ def close_ma_vol(df,select1='ma60',select2='ma120',select3='volume'):
         plt.show()
     except:
         pass
+        
+###  buysell_products 중복입력중에서 최종  bsdate만 남기고 delete하는 코드
+
+def delete_duplication(oname):
+    conn_str = (
+        r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
+        r'DBQ=C:/easypanme2015_premium/Data/office.mdb;PWD=sailer04@naver.com'
+        )
+    conn = pyodbc.connect(conn_str)
+    curs = conn.cursor()
+
+    onum = pd.read_sql(f"select * from buysell_products where o_num={oname} and keyindex = 89999", local_engine)
+    o_num_list = onum['p_num'].value_counts().loc[lambda x:x >1].index.tolist()
+    for i in o_num_list:    
+        # 전체 데이터와 keyindex=89999 데이터의 최근 날짜 조회
+        query_all = f"select top 1 bsdate from buysell_products where o_num={oname} and p_num = {i} order by bsdate desc"
+        df_all = pd.read_sql(query_all, local_engine)
+
+        query_one= f"select top 1 bsdate from buysell_products where o_num={oname} and keyindex = 89999 and p_num = {i} order by bsdate desc"
+        df_one = pd.read_sql(query_one, local_engine)
+
+        # 날짜 비교
+        latest_date_all = pd.to_datetime(df_all['bsdate'].iloc[0])
+        latest_date_89999 = pd.to_datetime(df_one['bsdate'].iloc[0])
+        formatted_date = latest_date_89999.strftime('#%Y-%m-%d#')  # Access SQL 날짜 형식으로 변환
+
+        
+
+        if latest_date_all > latest_date_89999:
+            print(f"전체 데이터의 최근 날짜가 더 최신입니다.")
+            delete_query = f"DELETE * FROM buysell_products where o_num={oname} and keyindex = 89999 and p_num = {i}"
+            curs.execute(delete_query)
+            conn.commit()
+        else:
+            delete_query = f"DELETE * FROM buysell_products WHERE o_num=643 AND keyindex = 89999 AND p_num = {i} AND bsdate < {formatted_date}"
+            curs.execute(delete_query)
+            conn.commit()
+
+            query_num = f"select top 1 num from buysell_products where o_num={oname} and keyindex = 89999 and p_num = {i} order by num desc"
+            num = pd.read_sql(query_num, local_engine)
+            delete_query = f"DELETE * FROM buysell_products where o_num={oname} and keyindex = 89999 and p_num = {i} and num < {num.iloc[0]['num']}"
+            curs.execute(delete_query)
+            conn.commit()        
 
 def market_ma(df,select1,select2):
     ma(df)
@@ -635,7 +796,47 @@ def period_down(from_day, to_day):
     df2 = df2.sort_values(by=['diff'], ascending=True)
     df2 = df2.reset_index(drop=True)
     #display(df2)
-    df2.to_excel(path_down+standard+'.xlsx')       
+    df2.to_excel(path_down+standard+'.xlsx')
+
+def get_naver_stock_list(market='KOSPI'):
+    base_url = "https://finance.naver.com/sise/sise_market_sum.naver"
+    params = {'sosok': 0 if market == 'KOSPI' else 1}
+    
+    tickers = []
+    names = []
+    
+    page = 1
+    while True:
+        params['page'] = page
+        response = requests.get(base_url, params=params)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        table = soup.find('table', {'class': 'type_2'})
+        if not table:
+            break
+        
+        rows = table.find_all('tr')[1:]
+        
+        for row in rows:
+            cols = row.find_all('td')
+            if len(cols) > 1:
+                ticker_link = cols[1].find('a')
+                if ticker_link:
+                    ticker = ticker_link['href'].split('=')[-1]
+                    name = cols[1].text.strip()
+                    tickers.append(ticker)
+                    names.append(name)
+        
+        next_page = soup.find('a', {'href': f'?sosok={params["sosok"]}&page={page+1}'})
+        if not next_page:
+            break
+        page += 1
+        
+        if page > 50:  # 최대 50페이지 제한
+            break
+    
+    return pd.DataFrame({'티커': tickers, '종목명': names})
+    
 
 class analysis:
 
@@ -765,8 +966,8 @@ class to_report:
         df3 = df3[:15]
         df4 = df4.reset_index(drop=True)
         df4 = df4[:15]
-        df3.to_excel(path_volume+to_day+'.xlsx')
-        df4.to_excel(path_price+to_day+'.xlsx')        
+        df3.to_excel(f"{path_volume}{str_today}.xlsx")
+        df4.to_excel(f"{path_price}{str_today}.xlsx")       
         display(df3)
         display(df4)        
 
@@ -1255,7 +1456,7 @@ class to_excel:
     program_trend_url = 'https://finance.naver.com/sise/programDealTrendDay.nhn?bizdate=20221215&sosok=&page='    
     future_url = 'http://finance.daum.net/api/future/KR4101PC0002/days?pagination=true&page='
     kospi_sector_url = "http://finance.daum.net/api/quotes/sectors?fieldName=&order=&perPage=&market=KOSPI&page=&changes=UPPER_LIMIT%2CRISE%2CEVEN%2CFALL%2CLOWER_LIMIT"
-    kosdaq_sector_url = "http://finance.daum.net/api/quotes/sectors?fieldName=&order=&perPage=&market=KOSDAQ&page=&changes=UPPER_LIMIT%2CRISE%2CEVEN%2CFALL%2CLOWER_LIMI"
+    kosdaq_sector_url = "http://finance.daum.net/api/quotes/sectors?fieldName=&order=&perPage=&market=KOSDAQ&page=&changes=UPPER_LIMIT%2CRISE%2CEVEN%2CFALL%2CLOWER_LIMIT"
 
     
     def get_investor_trend(self):
@@ -1641,7 +1842,7 @@ class to_excel:
             kpi200_df = str(kpi200_df['Date'])
             until_date = kpi200_df[5:15]
 
-            start = datetime.strptime(until_date , "%Y-%m-%d")
+            start = datetime.strptime(until_date, "%Y-%m-%d")
             until_date= (start + timedelta(days=1)).strftime('%Y-%m-%d')
     
         # 날짜를 받을 리스트
@@ -1935,7 +2136,13 @@ class to_excel:
         
         # 요청
         kospi_sector_res = req.urlopen(req.Request(kospi_sector_url, headers=headers)).read().decode('utf-8')
-        kosdaq_sector_res = req.urlopen(req.Request(kosdaq_sector_url, headers=headers)).read().decode('utf-8')
+        try:
+            kosdaq_sector_res = req.urlopen(req.Request(kosdaq_sector_url, headers=headers)).read().decode('utf-8')
+        except urllib.error.HTTPError as e:
+            print(f"HTTP Error {e.code}: {e.reason}")
+            print(f"Error content: {e.read().decode('utf-8')}")
+        except urllib.error.URLError as e:
+            print(f"URL Error: {e.reason}")
         # 응답 데이터 확인(Json Data)
         # print('res', res)
 

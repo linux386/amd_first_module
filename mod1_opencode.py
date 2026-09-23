@@ -8,12 +8,17 @@ import json
 import time
 import re
 import requests
-
-# KRX 로그인용 공용 세션 (login_krx가 사용)
-_session = requests.Session()
 import plotly.offline as offline
 import plotly.graph_objs as go
-import os,glob,shutil,io,sys
+import os
+import glob
+import shutil
+import io
+import sys
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
 
 # Optional dependency: pykrx (KRX 데이터 다운로드)
 try:
@@ -73,12 +78,26 @@ rc('font', family=font_name)
 
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
-warnings.filterwarnings("ignore", category=RuntimeWarning) 
-#from pandas.core.common import SettingWithCopyWarning
-#warnings.simplefilter(action="ignore", category=SettingWithCopyWarning)
-import matplotlib.pyplot as plt
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 from pandas.plotting import register_matplotlib_converters
 register_matplotlib_converters()
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+
+# Optional heavy deps: import lazily / tolerate missing installs.
+try:
+    from sklearn.preprocessing import MinMaxScaler
+except ImportError:  # type: ignore
+    MinMaxScaler = None  # type: ignore
+    logger.warning("sklearn is not installed. MinMax scaling plot helpers will not work.")
+
+try:
+    import talib.abstract as ta  # type: ignore
+except ImportError:
+    ta = None  # type: ignore
+    logger.warning("talib is not installed. ma() will be a no-op.")
 
 today =datetime.now()
 str_yesterday = (today-timedelta(1)).strftime('%Y-%m-%d')
@@ -86,57 +105,105 @@ str_today = today.strftime('%Y-%m-%d')
 #date_list = ['2008-01-01','2013-01-01','2018-01-01','2019-01-01']
 three_period=['day','week','month']
 
-# MySQL connection configuration
-host = "localhost"
-port = 3306
-user = "root"
-password = "leaf2027"
-database = "stock"
+# MySQL connection configuration (env override 가능, 하드코딩 비밀번호 제거)
+@dataclass
+class DBConfig:
+    host: str = field(default_factory=lambda: os.getenv("STOCK_DB_HOST", "localhost"))
+    port: int = field(default_factory=lambda: int(os.getenv("STOCK_DB_PORT", "3306")))
+    user: str = field(default_factory=lambda: os.getenv("STOCK_DB_USER", "root"))
+    password: str = field(default_factory=lambda: os.getenv("STOCK_DB_PASSWORD", ""))
+    database: str = field(default_factory=lambda: os.getenv("STOCK_DB_NAME", "stock"))
 
-# Connect to MySQL (optional)
+DB = DBConfig()
+host, port, user, password, database = DB.host, DB.port, DB.user, DB.password, DB.database
+
+# Lazy DB handles: import 시점에 접속하지 않음 (기존 전역명 유지)
 connection = None
 conn = None
 curs = None
 engine = None
 stock_last_day = str_today
 
-try:
-    connection = pymysql.connect(
-        host=host,
-        port=port,
-        user=user,
-        password=password,
-        database=database,
-        connect_timeout=5,
-    )
-    conn = pymysql.connect(
-        host=host,
-        port=port,
-        user=user,
-        password=password,
-        database=database,
-        connect_timeout=5,
-    )
-    curs = conn.cursor()
-    engine = sqlalchemy.create_engine(
-        'mysql+pymysql://root:leaf2027@localhost/stock?charset=utf8',
-        connect_args={'connect_timeout': 5},
-        pool_pre_ping=True,
-    )
 
-    stock_last_day_df = pd.read_sql(
-        "select Date from market where Name='삼성전자' order by Date desc limit 1",
-        engine,
-    )
-    stock_last_day_df['Date'] = pd.to_datetime(stock_last_day_df['Date']).dt.strftime('%Y-%m-%d')
-    stock_last_day = stock_last_day_df['Date'].to_list()[0]
-except Exception as e:
-    print(f"Warning: could not connect to MySQL or query stock dates: {e}")
-    connection = None
-    conn = None
-    curs = None
-    engine = None
-    # Keep defaults; functions that require a database connection should check engine/conn and handle None.
+def _connect_args(timeout: int = 5) -> dict:
+    return {"connect_timeout": timeout}
+
+
+def get_engine():
+    """SQLAlchemy engine을 지연 생성. 실패 시 None + 경고 (기존 동작 유지)."""
+    global engine
+    if engine is not None:
+        return engine
+    if not DB.password:
+        logger.warning("STOCK_DB_PASSWORD 미설정. DB 필요 함수는 engine=None으로 동작.")
+        return None
+    try:
+        engine = sqlalchemy.create_engine(
+            f'mysql+pymysql://{DB.user}:{DB.password}@{DB.host}:{DB.port}/{DB.database}?charset=utf8',
+            connect_args=_connect_args(5),
+            pool_pre_ping=True,
+        )
+        return engine
+    except Exception as e:
+        logger.warning(f"could not create engine: {e}")
+        return None
+
+
+def get_conn():
+    """pymysql 커넥션/커서를 지연 생성. (connection, conn, curs) 반환."""
+    global connection, conn, curs
+    if conn is not None:
+        return connection, conn, curs
+    if not DB.password:
+        return None, None, None
+    try:
+        connection = pymysql.connect(
+            host=DB.host, port=DB.port, user=DB.user,
+            password=DB.password, database=DB.database,
+            connect_timeout=5,
+        )
+        conn = pymysql.connect(
+            host=DB.host, port=DB.port, user=DB.user,
+            password=DB.password, database=DB.database,
+            connect_timeout=5,
+        )
+        curs = conn.cursor()
+    except Exception as e:
+        logger.warning(f"could not connect to MySQL: {e}")
+        connection, conn, curs = None, None, None
+    return connection, conn, curs
+
+
+def _require_engine():
+    eng = get_engine()
+    if eng is None:
+        raise ConnectionError("DB engine unavailable. STOCK_DB_* 환경변수를 설정하세요.")
+    return eng
+
+
+def _read_sql(query: str, eng=None) -> "pd.DataFrame":
+    return pd.read_sql(query, _require_engine() if eng is None else eng)
+
+
+def _refresh_stock_last_day() -> str:
+    """모듈 import 시 1회만 갱신 시도. 실패해도 기본값(str_today) 유지."""
+    global stock_last_day
+    try:
+        eng = get_engine()
+        if eng is None:
+            return stock_last_day
+        df = pd.read_sql(
+            "select Date from market where Name='삼성전자' order by Date desc limit 1",
+            eng,
+        )
+        df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
+        stock_last_day = df['Date'].to_list()[0]
+    except Exception as e:
+        logger.warning(f"could not query stock dates: {e}")
+    return stock_last_day
+
+
+_refresh_stock_last_day()
 
 
 def _close_db_connections():
@@ -172,17 +239,18 @@ path_close_ma120 = 'C:/Users/linux/OneDrive/stockdata/close_ma120/'
 kospi_next_day_no_hypyen = (today + timedelta(1)).strftime('%Y%m%d')
 final_day = pd.DataFrame({'Date': [str_today]})
 
-if engine is not None:
-    try:
-        kospi_final_day_df = pd.read_sql("select Date from kospi order by Date desc limit 1", engine)
+try:
+    _eng = get_engine()
+    if _eng is not None:
+        kospi_final_day_df = pd.read_sql("select Date from kospi order by Date desc limit 1", _eng)
         final_day = kospi_final_day_df
         kospi_final_day_df = pd.to_datetime(kospi_final_day_df['Date'])
         kospi_next_df = kospi_final_day_df + timedelta(1)  ##  최종날짜 다음날짜
         kospi_next_df = str(kospi_next_df)
         kospi_next_df = kospi_next_df[4:14]                ## 2020-07-13
-        kospi_next_day_no_hypyen = kospi_next_df.replace('-','')   ## 20200713
-    except Exception as e:
-        print(f"Warning: could not load kospi final day from database: {e}")
+        kospi_next_day_no_hypyen = kospi_next_df.replace('-', '')   ## 20200713
+except Exception as e:
+    logger.warning(f"could not load kospi final day from database: {e}")
         
 def login_krx(login_id: str, login_pw: str) -> bool:
     """
@@ -198,6 +266,7 @@ def login_krx(login_id: str, login_pw: str) -> bool:
     )
 
     try:
+        _session = requests.Session()
         # 초기 세션 발급
         _session.get(_LOGIN_PAGE, headers={"User-Agent": _UA}, timeout=15)
         _session.get(_LOGIN_JSP, headers={"User-Agent": _UA, "Referer": _LOGIN_PAGE}, timeout=15)
@@ -502,51 +571,42 @@ def from_excel_analysis(path,file_day,from_date):
         close_ma_vol(df, 'ma60')
         
 def last_page(source):
-    # pgRR 태그가 있는지 먼저 확인합니다.
-    pg_rr = source.find('td', class_='pgRR')
-    
-    # 만약 끝 페이지 버튼이 없다면, 현재 페이지가 마지막(1페이지)입니다.
-    if not pg_rr:
-        return 1
-        
-    last = pg_rr.find('a')['href']
+    last = source.find('td',class_='pgRR').find('a')['href']
     last = last.split('page')[1]
     last = last.split('=')[1]
-    return int(last)
+    last = int(last)
+    print(last)
+    return last
 
-
-def select_market_at(name,at_date):   ###  name='kospi' or 'kosdaq'
+def select_market_at(name: str, at_date: str) -> "pd.DataFrame":   ###  name='kospi' or 'kosdaq'
     select_query = "select * from "
-    date_query = " where Date = "    
-    var = select_query + name + date_query+"'"+at_date+"'" 
-    df = pd.read_sql(var, engine)
-    return df
+    date_query = " where Date = "
+    var = select_query + name + date_query + "'" + at_date + "'"
+    return _read_sql(var)
 
-def select_market_period(name, from_date, to_date=None):   ###  name='kospi' or 'kosdaq'
+def select_market_period(name: str, from_date: str, to_date: Optional[str] = None) -> "pd.DataFrame":   ###  name='kospi' or 'kosdaq'
     select_query = "select * from "
-    date_query = " where Date >= "    
+    date_query = " where Date >= "
     var = select_query + name + date_query + "'" + from_date + "'"
     if to_date:
         var += " and Date <= '" + to_date + "'"
-    df = pd.read_sql(var, engine)
-    return df
+    return _read_sql(var)
 
 
-def select_market(name, from_date, to_date=str_today):
+def select_market(name: str, from_date: str, to_date: str = str_today) -> "pd.DataFrame":
     """Wrapper around select_market_period for compatibility with older code."""
     return select_market_period(name, from_date, to_date)
 
-def select_stock(name, from_date, to_date=str_today):
+def select_stock(name: str, from_date: str, to_date: str = str_today) -> "pd.DataFrame":
     ''' name : 'all'(모든주식),  'hrs'(주식이름이 'hrs'),  from_date : 시작날짜,  to_date : 마지막날짜) '''
     if name == 'all':
         select_query = "select * from market where Date >=  "
 
     else:
-        select_query = "select * from market where Name="+"'"+name +"'"+' '+"and  Date >=  "
-        
-    var = select_query +"'"+from_date+"'"  +" "+ 'and Date <=' + "'"+to_date+"'"
-    df = pd.read_sql(var, engine)
-    return df
+        select_query = "select * from market where Name=" + "'" + name + "'" + ' ' + "and  Date >=  "
+
+    var = select_query + "'" + from_date + "'" + " " + 'and Date <=' + "'" + to_date + "'"
+    return _read_sql(var)
 
 
 def make_name_list(path_name=path_depress, arg = "*day*.*" , num=0, degree=30):
@@ -587,11 +647,15 @@ def min_max(df,select):  ## select : Open, High, Low 중 선택
     df1 = df1.set_index(df['date'])
     return df1
 
-def ma(DataFrame):
+def ma(DataFrame: "pd.DataFrame") -> "pd.DataFrame":
+    """TA-Lib 이동평균(ma5~ma120) 추가. talib 없으면 원본 그대로 반환."""
+    if ta is None:
+        logger.warning("ma() skipped: talib not installed.")
+        return DataFrame
     try:
         df = DataFrame
-        df.columns=df.columns.str.lower()
-        df[['volume','close']] = df[['volume','close']].astype(float) #  TA-Lib로 평균을 구하려면 실수로 만들어야 함
+        df.columns = df.columns.str.lower()
+        df[['volume', 'close']] = df[['volume', 'close']].astype(float)
 
         talib_ma5 = ta.MA(df, timeperiod=5)
         df['ma5'] = talib_ma5
@@ -613,9 +677,19 @@ def ma(DataFrame):
 
         talib_ma120 = ta.MA(df, timeperiod=120)
         df['ma120'] = talib_ma120
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"ma() failed, returning input as-is: {e}")
     return df
+
+
+def _minmax_frame(df: "pd.DataFrame", cols: list, index_col: str = 'date') -> "pd.DataFrame":
+    """중복 제거용: MinMax 스케일링 + index 세팅 공통 헬퍼."""
+    if MinMaxScaler is None:
+        raise ImportError("sklearn.minmax not available.")
+    scaler = MinMaxScaler()
+    data = scaler.fit_transform(df[cols].values)
+    out = pd.DataFrame(data, columns=cols)
+    return out.set_index(df[index_col])
 
 ##  종목을 date_list에 있는 시점에서  ex: date_list=['2020-01-01','2020-06-30','2021-01-01']  graph 변화를 볼수 있다
 def stock_volume_graph(name, date_list):  
@@ -643,37 +717,27 @@ def market_close_graph(name, date_list):
             df = select_market_period(i, j)
             market_ma(df,'ma60','ma120')            
     
-def close_ma(df,select1='ma60',select2='ma120'):  ##  select1, select2 : ma5, ma10, ma15, ma20, ma30, ma60, ma120 중에 선택
+def close_ma(df: "pd.DataFrame", select1: str = 'ma60', select2: str = 'ma120') -> None:  ##  select1, select2 : ma5, ma10, ma15, ma20, ma30, ma60, ma120 중에 선택
     try:
         ma(df)
-
-        source = MinMaxScaler()
-        data = source.fit_transform(df[['close',select1,select2]].values)
-        df1 = pd.DataFrame(data)
-        df1.columns=['close',select1,select2]
-        df1 = df1.set_index(df['date'])
-        df1.plot(figsize=(16,4))
+        df1 = _minmax_frame(df, ['close', select1, select2])
+        df1.plot(figsize=(16, 4))
         plt.title(df['name'][0])
         plt.grid(True)
         plt.show()
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"close_ma() failed: {e}")
 
-def close_ma_vol(df,select1='ma60',select2='ma120',select3='volume'):
+def close_ma_vol(df: "pd.DataFrame", select1: str = 'ma60', select2: str = 'ma120', select3: str = 'volume') -> None:
     try:
         ma(df)
-
-        source = MinMaxScaler()
-        data = source.fit_transform(df[['close',select1,select2,select3]].values)
-        df1 = pd.DataFrame(data)
-        df1.columns=['close',select1,select2,select3]
-        df1 = df1.set_index(df['date'])
-        df1.plot(figsize=(16,4))
+        df1 = _minmax_frame(df, ['close', select1, select2, select3])
+        df1.plot(figsize=(16, 4))
         plt.title(df['name'][0])
         plt.grid(True)
         plt.show()
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"close_ma_vol() failed: {e}")
         
 ###  buysell_products 중복입력중에서 최종  bsdate만 남기고 delete하는 코드
 
@@ -1444,8 +1508,7 @@ class to_sql:
         query = "delete from  market where Name = "+"'"+Name+"'"
         curs.execute(query)
         conn.commit()
-        # NOTE: 공용 conn을 여기서 닫지 않는다. 닫으면 이후 모든 DB 호출이 죽는다.
-        # 종료 시 정리는 하단의 atexit(_close_db_connections)가 담당한다.
+        conn.close()
 
         df = fdr.DataReader(Code, '1995')
         df.to_excel('C:/Users/linux/OneDrive/'+Code+'.xlsx', encoding='UTF-8')
@@ -1458,179 +1521,6 @@ class to_sql:
 
         df.to_sql(name='market', con=engine, if_exists='append', index = False)
         
-
-    def update_market_incremental(self, end_date=None, full_start='19950101',
-                                  table='market', dry_run=False, sleep_sec=0.2,
-                                  limit_codes=None):
-        """DB에 없는 날짜의 종목 데이터만 KRX(pykrx)에서 읽어와 테이블에 추가한다.
-
-        기존 insert_all_stock / excel_to_sql(시장)은 시작일부터 전 종목을
-        매번 전부 다시 받는 방식이라 느리고 중복 위험이 있다. 이 함수는
-        종목별 DB 최종일자(MAX(Date)) 다음날부터 최신 거래일까지,
-        DB에 이미 있는 날짜는 제외하고 없는 날짜 행만 INSERT 한다.
-        → 재실행해도 중복 입력이 생기지 않는다.
-
-        - 상장폐지 추정 코드(DB에만 있고 KRX 목록에 없음)는 건너뛴다.
-        - DB에 한 번도 없는 신규 상장 종목은 full_start부터 전 구간 수집한다.
-        - 빠른 종목별 조회를 위해 (Code, Date) 인덱스를 최초 1회 생성한다.
-
-        예) to_sql().update_market_incremental(dry_run=True)  # 대상 미리보기
-            to_sql().update_market_incremental()               # 실제 업데이트
-            to_sql().update_market_incremental(limit_codes=['005930'])  # 특정 종목만
-        """
-        import time as _time
-        if stock is None:
-            print('pykrx가 없어서 실행할 수 없습니다. pip install pykrx')
-            return None
-        if engine is None:
-            print('DB(engine)에 연결되어 있지 않습니다.')
-            return None
-
-        # 0) 종목별 조회를 빠르게 하기 위한 인덱스 (최초 1회만 실제 생성됨)
-        try:
-            with engine.begin() as _con:
-                _con.execute(sqlalchemy.text(
-                    f'CREATE INDEX IF NOT EXISTS idx_{table}_code_date '
-                    f'ON {table} (Code, Date)'))
-            print(f'index ok: idx_{table}_code_date')
-        except Exception as e:
-            print(f'index 생성 생략/실패(무시 가능): {e}')
-
-        # 1) 최신 거래일자 결정
-        if end_date is None:
-            probe = dt.date.today()
-            end_date = None
-            for _ in range(10):
-                s = probe.strftime('%Y%m%d')
-                try:
-                    _df = stock.get_market_ohlcv(s, s, '005930')
-                    if _df is not None and not _df.empty:
-                        end_date = s
-                        break
-                except Exception:
-                    pass
-                probe -= dt.timedelta(days=1)
-            if end_date is None:
-                print('최신 거래일자를 찾지 못했습니다.')
-                return None
-        end_dt = dt.datetime.strptime(end_date, '%Y%m%d').date()
-        print(f'업데이트 목표일자: {end_date}')
-
-        # 2) 현재 KRX 상장 목록 (limit_codes가 있으면 그것만)
-        if limit_codes:
-            listed = [str(c).zfill(6) for c in limit_codes]
-        else:
-            listed = []
-            try:
-                for _mkt in ('KOSPI', 'KOSDAQ'):
-                    listed += [str(c) for c in
-                               stock.get_market_ticker_list(end_date, market=_mkt)]
-            except Exception as e:
-                print(f'KRX 상장목록 조회 실패: {e}')
-                return None
-        print(f'KRX 상장 종목 수: {len(listed)}')
-
-        # 3) DB 종목별 최종일자 + 그때의 이름 (서버에서 1회 집계)
-        db_max, db_name = {}, {}
-        try:
-            _g = pd.read_sql(
-                f'SELECT Code, Name, MAX(Date) AS m FROM {table} GROUP BY Code, Name',
-                engine)
-            for _r in _g.itertuples():
-                _d = pd.to_datetime(_r.m).date()
-                if _r.Code not in db_max or _d > db_max[_r.Code]:
-                    db_max[_r.Code] = _d
-                    db_name[_r.Code] = _r.Name
-        except Exception as e:
-            print(f'DB 최종일자 조회 실패: {e}')
-            return None
-
-        # DB에 없는 코드(신규 상장 추정)는 KRX에서 이름 조회 (소수라 개별조회로 충분)
-        for _code in listed:
-            if _code not in db_name:
-                try:
-                    db_name[_code] = stock.get_market_ticker_name(_code)
-                except Exception:
-                    db_name[_code] = _code
-                _time.sleep(0.1)
-
-        # 4) 종목별 필요 구간 계산 (최종일자 다음날 ~ 목표일자)
-        jobs = []  # (code, name, start_date)
-        skipped = 0
-        for _code in sorted(set(listed)):
-            _last = db_max.get(_code)
-            if _last is None:
-                _start = dt.datetime.strptime(full_start, '%Y%m%d').date()
-            else:
-                _start = _last + dt.timedelta(days=1)
-                if _start > end_dt:
-                    skipped += 1
-                    continue
-            jobs.append((_code, db_name.get(_code, _code), _start))
-        n_delisted = len([c for c in db_max if c not in set(listed)])
-        print(f'최신 상태(스킵): {skipped}개 / 업데이트 대상: {len(jobs)}개 / '
-              f'DB에만 있는 코드(상장폐지 추정, 스킵): {n_delisted}개')
-
-        if dry_run:
-            print('--- DRY-RUN: 다운로드/입력 없이 대상만 표시 (상위 20개) ---')
-            for _code, _nm, _st in jobs[:20]:
-                print(f'  {_code} {_nm}: {_st} ~ {end_dt}')
-            if len(jobs) > 20:
-                print(f'  ... 외 {len(jobs) - 20}개')
-            return {'dry_run': True, 'jobs': len(jobs)}
-
-        # 5) KRX에서 없는 구간만 조회 → DB 기존 날짜 제외 → 모아서 1회 입력
-        new_frames, done, failed = [], 0, []
-        for _i, (_code, _nm, _st) in enumerate(jobs, 1):
-            try:
-                _df = stock.get_market_ohlcv(_st.strftime('%Y%m%d'), end_date, _code)
-                if _df is None or _df.empty:
-                    continue
-                _df = _df.copy()
-                _df.columns = [str(c).strip() for c in _df.columns]
-                need = {'시가': 'Open', '고가': 'High', '저가': 'Low',
-                        '종가': 'Close', '거래량': 'Volume'}
-                if not set(need) <= set(_df.columns):
-                    failed.append((_code, 'columns'))
-                    continue
-                _df = _df.rename(columns=need)[['Open', 'High', 'Low', 'Close', 'Volume']]
-                _df = _df.dropna()
-                if _df.empty:
-                    continue
-                _df.index = pd.to_datetime(_df.index).date
-                # DB에 이미 있는 날짜 제외 (같은 Code 기준) → 중복 입력 방지
-                _have = pd.read_sql(
-                    f'SELECT Date FROM {table} WHERE Code=%s AND Date>=%s',
-                    engine, params=(_code, _st.strftime('%Y-%m-%d')))
-                _have_set = (set(pd.to_datetime(_have['Date']).dt.date)
-                             if not _have.empty else set())
-                _df = _df[[d not in _have_set for d in _df.index]]
-                if _df.empty:
-                    continue
-                for _col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                    _df[_col] = _df[_col].astype(int)
-                _df['Code'], _df['Name'] = _code, _nm
-                _df.index.names = ['Date']
-                new_frames.append(
-                    _df[['Code', 'Name', 'Open', 'High', 'Low', 'Volume', 'Close']])
-                done += 1
-            except Exception as e:
-                failed.append((_code, str(e)[:100]))
-            if _i % 50 == 0:
-                print(f'  진행 {_i}/{len(jobs)} (수집 {done})')
-            _time.sleep(sleep_sec)
-
-        if new_frames:
-            _all = pd.concat(new_frames)
-            _all.to_sql(name=table, con=engine, if_exists='append')
-            print(f'입력 완료: {len(_all)}행 ({done}종목)')
-        else:
-            print('새로 받을 데이터가 없습니다.')
-        if failed:
-            print(f'실패 {len(failed)}건(상위): {failed[:10]}')
-        return {'jobs': len(jobs), 'updated': done,
-                'rows': sum(len(f) for f in new_frames), 'failed': failed}
-
 
 class to_excel:
     investor_trend_url = 'http://finance.naver.com/sise/investorDealTrendDay.nhn?bizdate=20220601&sosok=&page='
