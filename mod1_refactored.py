@@ -1312,6 +1312,80 @@ class to_sql:
         return {'jobs': len(jobs), 'updated': done,
                 'rows': sum(len(f) for f in new_frames), 'failed': failed}
 
+    def update_index_incremental(self, end_date=None, start_if_empty='19950103', dry_run=False):
+        """Append missing KOSPI/KOSDAQ index OHLCV rows through market's latest date."""
+        if engine is None:
+            raise ConnectionError('Configure STOCK_DB_PASSWORD before updating index tables.')
+        if get_index_ohlcv_by_date is None:
+            raise ImportError('Install pykrx to download index OHLCV data.')
+
+        if end_date is None:
+            latest_market = pd.read_sql_query(
+                text('SELECT MAX(`Date`) AS max_date FROM `market`'), _require_engine()
+            )
+            if latest_market.empty or pd.isna(latest_market.iloc[0]['max_date']):
+                raise RuntimeError('market 테이블에서 최신 거래일을 찾을 수 없습니다.')
+            end_date = latest_market.iloc[0]['max_date']
+        end_day = pd.Timestamp(end_date).date()
+        start_default = pd.to_datetime(start_if_empty, format='%Y%m%d').date()
+
+        results = {}
+        for table, market_code in (('kospi', '1001'), ('kosdaq', '2001')):
+            latest = pd.read_sql_query(
+                text(f'SELECT MAX(`Date`) AS max_date FROM `{table}`'), _require_engine()
+            )
+            last_date = latest.iloc[0]['max_date'] if not latest.empty else None
+            start_day = (pd.Timestamp(last_date).date() + dt.timedelta(days=1)) if pd.notna(last_date) else start_default
+            if start_day > end_day:
+                results[table] = {'rows': 0, 'status': 'already_current', 'last_date': str(last_date)}
+                continue
+            if dry_run:
+                results[table] = {'rows': 0, 'status': 'preview', 'from': start_day.isoformat(), 'to': end_day.isoformat()}
+                continue
+
+            raw = get_index_ohlcv_by_date(
+                start_day.strftime('%Y%m%d'), end_day.strftime('%Y%m%d'), market_code
+            )
+            if raw is None or raw.empty:
+                results[table] = {'rows': 0, 'status': 'no_data'}
+                continue
+            frame = raw.copy()
+            frame.columns = [str(column).strip() for column in frame.columns]
+            frame = frame.rename(columns={
+                '시가': 'Open', '고가': 'High', '저가': 'Low',
+                '종가': 'Close', '거래량': 'Volume',
+                'open': 'Open', 'high': 'High', 'low': 'Low',
+                'close': 'Close', 'volume': 'Volume',
+            })
+            if 'Date' not in frame.columns:
+                frame.index.name = 'Date'
+                frame = frame.reset_index()
+            required = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+            missing = set(required) - set(frame.columns)
+            if missing:
+                raise ValueError(f'{table} index data missing columns: {sorted(missing)}')
+            frame = frame[required].copy()
+            frame['Date'] = pd.to_datetime(frame['Date'], errors='coerce').dt.date
+            frame = frame.dropna(subset=required)
+            if last_date is not None:
+                frame = frame[frame['Date'] > pd.Timestamp(last_date).date()]
+            frame = frame[frame['Date'] <= end_day].drop_duplicates(subset=['Date'])
+            if frame.empty:
+                results[table] = {'rows': 0, 'status': 'already_current'}
+                continue
+
+            # The stock DB schema has a Market column on both index tables.
+            frame['Market'] = table
+            with _require_engine().begin() as transaction:
+                frame.to_sql(table, con=transaction, if_exists='append', index=False, chunksize=1000)
+            results[table] = {
+                'rows': int(len(frame)),
+                'from': frame['Date'].min().isoformat(),
+                'to': frame['Date'].max().isoformat(),
+                'status': 'inserted',
+            }
+        return results
+
 
 class to_excel:
     investor_trend_url = 'http://finance.naver.com/sise/investorDealTrendDay.nhn?bizdate=20220601&sosok=&page='
