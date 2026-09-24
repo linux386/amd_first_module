@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.request import urlopen as _stdlib_urlopen
 import urllib.request as req
 
 import numpy as np
@@ -37,6 +37,11 @@ from sqlalchemy.engine import URL
 logger = logging.getLogger(__name__)
 _session = requests.Session()
 
+
+def urlopen(url, timeout=20):
+    """urllib wrapper with a finite timeout for the legacy Naver scrapers."""
+    return _stdlib_urlopen(url, timeout=timeout)
+
 # Optional integrations are isolated so a missing scraper/chart package does not
 # prevent importing the core stock-data helpers.
 _pykrx_output = io.StringIO()
@@ -46,6 +51,12 @@ with redirect_stdout(_pykrx_output), redirect_stderr(_pykrx_output):
         from pykrx.stock import get_index_ohlcv_by_date
     except ImportError:
         stock = bond = get_index_ohlcv_by_date = None
+    try:
+        # The convenience wrapper drops ACC_OPNINT_QTY; this lower-level KRX
+        # response retains daily open interest for each derivatives contract.
+        from pykrx.website.krx.future.core import 전종목시세 as _KrxFutureQuotes
+    except ImportError:
+        _KrxFutureQuotes = None
 if _pykrx_output.getvalue():
     logger.debug('pykrx import notice: %s', _pykrx_output.getvalue().strip())
 
@@ -55,6 +66,18 @@ try:
 except ImportError:
     UserAgent = None
     ua = None
+
+
+def _browser_user_agent():
+    if UserAgent is not None:
+        try:
+            return UserAgent(browsers=['chrome', 'edge']).random
+        except Exception:
+            logger.debug('fake_useragent lookup failed; using a static User-Agent.', exc_info=True)
+    return (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    )
 
 try:
     import FinanceDataReader as fdr
@@ -1461,10 +1484,12 @@ class to_sql:
         date_results = []
         for trade_day in trading_dates:
             day_key = trade_day.strftime('%Y%m%d')
+            print(f'Fetching KRX per-stock feature snapshot for {day_key}...', flush=True)
             daily_frames = []
             market_errors = []
             for market_name in ('KOSPI', 'KOSDAQ'):
                 try:
+                    print(f'  {market_name}: fetching market cap/flow/short data', flush=True)
                     cap = stock.get_market_cap_by_ticker(day_key, market=market_name)
                     if cap is None or cap.empty:
                         raise ValueError('market-cap endpoint returned no rows')
@@ -1555,6 +1580,848 @@ class to_sql:
             print(f'{day_key}: wrote {len(complete_day):,} per-stock KRX feature rows')
 
         return {'dates': len(trading_dates), 'rows': rows_written, 'results': date_results}
+
+    def update_naver_futures_index_daily(
+        self, index_code='FUT', start_date='2020-04-17', page_size=20,
+        max_pages=300, sleep_sec=0.1,
+    ):
+        """Incrementally store Naver's paginated continuous-futures OHLC series."""
+        eng = _require_engine()
+        coverage = pd.read_sql_query(
+            text(
+                'SELECT MIN(`trade_date`) AS min_date, MAX(`trade_date`) AS max_date '
+                'FROM `limitup_futures_index_daily` '
+                'WHERE `index_code`=:index_code'
+            ),
+            eng,
+            params={'index_code': index_code},
+        ).iloc[0]
+        earliest = coverage['min_date']
+        latest = coverage['max_date']
+        requested_start = pd.Timestamp(start_date).date()
+        cutoff = (
+            requested_start
+            if earliest is None or pd.isna(earliest) or pd.Timestamp(earliest).date() > requested_start
+            else pd.Timestamp(latest).date()
+        )
+        url = f'https://stock.naver.com/api/securityFe/api/index/{index_code}/price'
+        headers = {
+            'User-Agent': _browser_user_agent(),
+            'Referer': f'https://stock.naver.com/domestic/index/{index_code}/price',
+            'Accept': 'application/json, text/plain, */*',
+        }
+        records = []
+        pages = 0
+        for page in range(1, max_pages + 1):
+            response = requests.get(
+                url, params={'page': page, 'pageSize': page_size},
+                headers=headers, timeout=20,
+            )
+            response.raise_for_status()
+            items = response.json()
+            if not isinstance(items, list) or not items:
+                break
+            pages = page
+            page_days = []
+            for item in items:
+                trade_day = datetime.strptime(str(item['localTradedAt'])[:10], '%Y-%m-%d').date()
+                page_days.append(trade_day)
+                if trade_day < cutoff:
+                    continue
+
+                def _number(field):
+                    value = item.get(field)
+                    if value is None:
+                        return None
+                    value = str(value).replace(',', '').strip()
+                    return pd.to_numeric(value, errors='coerce')
+
+                prev_change = _number('compareToPreviousClosePrice')
+                records.append({
+                    'trade_date': trade_day,
+                    'index_code': index_code,
+                    'index_name': '코스피200 선물 연속지수',
+                    'open_price': _number('openPrice'),
+                    'high_price': _number('highPrice'),
+                    'low_price': _number('lowPrice'),
+                    'close_price': _number('closePrice'),
+                    'change_value': prev_change,
+                    'change_pct': _number('fluctuationsRatio'),
+                    'source': 'naver_stock_index_price',
+                    'raw_payload': json.dumps(item, ensure_ascii=False, separators=(',', ':')),
+                })
+            reached_cutoff = min(page_days) <= cutoff
+            last_page = len(items) < page_size
+            if page == 1 or page % 10 == 0 or reached_cutoff or last_page:
+                print(
+                    f'futures index {index_code}: page {page}, '
+                    f'{len(items)} rows ({page_days[0]} ~ {page_days[-1]})',
+                    flush=True,
+                )
+            if reached_cutoff or last_page:
+                break
+            time.sleep(sleep_sec)
+
+        if not records:
+            return {'rows': 0, 'pages': pages, 'status': 'already_current_or_no_data'}
+        frame = pd.DataFrame.from_records(records).drop_duplicates(
+            subset=['trade_date', 'index_code'], keep='last'
+        ).sort_values('trade_date')
+        with eng.begin() as transaction:
+            for trade_day in frame['trade_date'].drop_duplicates():
+                transaction.execute(
+                    text(
+                        'DELETE FROM `limitup_futures_index_daily` '
+                        'WHERE `trade_date`=:trade_date AND `index_code`=:index_code'
+                    ),
+                    {'trade_date': trade_day, 'index_code': index_code},
+                )
+            frame.to_sql(
+                'limitup_futures_index_daily', con=transaction,
+                if_exists='append', index=False, chunksize=500,
+            )
+        return {
+            'rows': int(len(frame)),
+            'pages': pages,
+            'from': frame['trade_date'].min().isoformat(),
+            'to': frame['trade_date'].max().isoformat(),
+            'status': 'upserted',
+        }
+
+    def update_naver_futures_investor_daily(self, index_code='FUT'):
+        """Backfill/update Naver's paginated daily futures investor net contracts."""
+        eng = _require_engine()
+        start_day = datetime.strptime('2020-04-17', '%Y-%m-%d').date()
+        latest_price = pd.read_sql_query(
+            text(
+                'SELECT MAX(`trade_date`) AS max_date FROM `limitup_futures_index_daily` '
+                'WHERE `index_code`=:index_code'
+            ),
+            eng,
+            params={'index_code': index_code},
+        ).iloc[0]['max_date']
+        bizdate = (
+            pd.Timestamp(latest_price).strftime('%Y%m%d')
+            if latest_price is not None and not pd.isna(latest_price)
+            else datetime.now().strftime('%Y%m%d')
+        )
+        coverage = pd.read_sql_query(
+            text(
+                'SELECT MIN(`trade_date`) AS min_date, MAX(`trade_date`) AS max_date '
+                'FROM `limitup_futures_investor_daily` WHERE `index_code`=:index_code'
+            ),
+            eng,
+            params={'index_code': index_code},
+        ).iloc[0]
+        earliest = coverage['min_date']
+        latest = coverage['max_date']
+        cutoff = (
+            start_day
+            if earliest is None or pd.isna(earliest) or pd.Timestamp(earliest).date() > start_day
+            else pd.Timestamp(latest).date()
+        )
+        url = 'https://stock.naver.com/api/domestic/market/trend/daily'
+        headers = {
+            'User-Agent': _browser_user_agent(),
+            'Referer': 'https://stock.naver.com/market/stock/kr/trend/trader',
+            'Accept': 'application/json, text/plain, */*',
+        }
+        records = []
+        pages = 0
+        page_size = 30
+        for start_idx in range(0, 300):
+            response = requests.get(
+                url,
+                params={
+                    'tradeType': 'KRX', 'marketType': index_code,
+                    'bizdate': bizdate, 'startIdx': start_idx,
+                    'pageSize': page_size,
+                },
+                headers=headers,
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            content = payload.get('content', []) if isinstance(payload, dict) else []
+            if not content:
+                break
+            pages = start_idx + 1
+            page_days = []
+            for item in content:
+                trade_day = datetime.strptime(str(item['bizdate']), '%Y%m%d').date()
+                page_days.append(trade_day)
+                if trade_day < cutoff:
+                    continue
+                net_by_group = {}
+                raw_values = item.get('netAmounts') or []
+                for detail in raw_values:
+                    code = str(detail.get('investorGubun', '')).strip()
+                    if code in ('9999', ''):
+                        continue
+                    if code == '3100':
+                        code = '3000'
+                    elif code == '9001':
+                        code = '9000'
+                    elif code == '7000':
+                        code = '6000'
+                    raw_value = detail.get('diffValue')
+                    if raw_value is None or str(raw_value).strip() == '':
+                        continue
+                    try:
+                        net_by_group[code] = net_by_group.get(code, 0) + int(
+                            str(raw_value).replace(',', '')
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                institution_codes = ('1000', '2000', '3000', '4000', '5000', '6000')
+                has_institution_breakdown = any(code in net_by_group for code in institution_codes)
+                institution_net = (
+                    sum(net_by_group.get(code, 0) for code in institution_codes)
+                    if has_institution_breakdown
+                    else None
+                )
+                records.append({
+                    'trade_date': trade_day,
+                    'index_code': index_code,
+                    'index_name': '코스피200 선물',
+                    'personal_net_flow': net_by_group.get('8000'),
+                    'foreign_net_flow': net_by_group.get('9000'),
+                    'institutional_net_flow': institution_net,
+                    'unit_note': 'net contracts (Naver trader table)',
+                    'source': 'naver_market_trend_daily',
+                    'raw_payload': json.dumps(item, ensure_ascii=False, separators=(',', ':')),
+                })
+            reached_cutoff = min(page_days) <= cutoff
+            total_pages = int(payload.get('totalPages') or 0)
+            if start_idx == 0 or (start_idx + 1) % 10 == 0 or reached_cutoff:
+                print(
+                    f'futures investor {index_code}: page {start_idx + 1}, '
+                    f'{len(content)} dates ({page_days[0]} ~ {page_days[-1]})',
+                    flush=True,
+                )
+            if reached_cutoff or len(content) < page_size or (total_pages and start_idx + 1 >= total_pages):
+                break
+            time.sleep(0.1)
+
+        if not records:
+            return {'rows': 0, 'pages': pages, 'status': 'already_current_or_no_data'}
+        frame = pd.DataFrame.from_records(records).drop_duplicates(
+            subset=['trade_date', 'index_code'], keep='last'
+        ).sort_values('trade_date')
+        with eng.begin() as transaction:
+            for trade_day in frame['trade_date'].drop_duplicates():
+                transaction.execute(
+                    text(
+                        'DELETE FROM `limitup_futures_investor_daily` '
+                        'WHERE `trade_date`=:trade_date AND `index_code`=:index_code'
+                    ),
+                    {'trade_date': trade_day, 'index_code': index_code},
+                )
+            frame.to_sql(
+                'limitup_futures_investor_daily', con=transaction,
+                if_exists='append', index=False, chunksize=500,
+            )
+        return {
+            'rows': int(len(frame)),
+            'pages': pages,
+            'from': frame['trade_date'].min().isoformat(),
+            'to': frame['trade_date'].max().isoformat(),
+            'status': 'upserted',
+            'index_code': index_code,
+            'unit': 'net contracts',
+        }
+
+    def update_legacy_future_daily(self, start_date='2020-04-17'):
+        """Backfill/update `future.Future` from Naver FUT daily prices.
+
+        Existing investor/OI values are preserved. New dates receive available
+        KRX OI and Naver investor flows; unavailable historical fields remain
+        NULL rather than being fabricated as zero. Re-running updates prices
+        in place and inserts only dates not already in the legacy table.
+        """
+        eng = _require_engine()
+        start_day = pd.Timestamp(start_date).date()
+        prices = pd.read_sql_query(
+            text(
+                'SELECT `trade_date`, `close_price` FROM `limitup_futures_index_daily` '
+                'WHERE `index_code`=:index_code AND `trade_date`>=:start_date '
+                'ORDER BY `trade_date`'
+            ),
+            eng,
+            params={'index_code': 'FUT', 'start_date': start_day},
+        )
+        if prices.empty:
+            return {'rows': 0, 'status': 'no_futures_price_history', 'from': start_day.isoformat()}
+        prices['trade_date'] = pd.to_datetime(prices['trade_date']).dt.date
+        prices['close_price'] = pd.to_numeric(prices['close_price'], errors='coerce')
+        prices = prices.dropna(subset=['trade_date', 'close_price']).drop_duplicates(
+            subset=['trade_date'], keep='last'
+        ).sort_values('trade_date')
+
+        # Expand legacy columns to fit the new futures price level and allow
+        # NULL where historical investor/OI sources do not provide a value.
+        legacy_columns = pd.read_sql_query(text('SHOW COLUMNS FROM `future`'), eng)
+        column_map = {str(item['Field']): item for _, item in legacy_columns.iterrows()}
+        required_columns = {'Date', 'Future', '미결제약정', '외국인', '기관', '개인'}
+        missing_columns = required_columns - set(column_map)
+        if missing_columns:
+            raise RuntimeError(f'future table is missing columns: {sorted(missing_columns)}')
+
+        schema_targets = {
+            'Future': ('DECIMAL(12,4)', 'price'),
+            '미결제약정': ('BIGINT', 'integer'),
+            '외국인': ('DECIMAL(20,4)', 'flow'),
+            '기관': ('DECIMAL(20,4)', 'flow'),
+            '개인': ('DECIMAL(20,4)', 'flow'),
+        }
+        for column_name, (target_type, kind) in schema_targets.items():
+            metadata = column_map[column_name]
+            current_type = str(metadata['Type']).lower()
+            nullable = str(metadata['Null']).upper() == 'YES'
+            if kind == 'price':
+                needs_type_change = not current_type.startswith('decimal(12,4)')
+                null_sql = 'NULL' if nullable else 'NOT NULL'
+            elif kind == 'integer':
+                needs_type_change = not (
+                    current_type.startswith('bigint') and 'unsigned' not in current_type
+                )
+                null_sql = 'NULL'
+            else:
+                match = re.search(r'(?:decimal|numeric)\((\d+)\s*,\s*(\d+)\)', current_type)
+                flow_type_ok = False
+                if match and 'unsigned' not in current_type:
+                    precision, scale = map(int, match.groups())
+                    flow_type_ok = precision - scale >= 10 and scale >= 4
+                needs_type_change = not flow_type_ok
+                null_sql = 'NULL'
+            needs_null_change = kind != 'price' and not nullable
+            if needs_type_change or needs_null_change:
+                with eng.begin() as schema_transaction:
+                    schema_transaction.execute(text(
+                        f'ALTER TABLE `future` MODIFY COLUMN `{column_name}` {target_type} {null_sql}'
+                    ))
+                print(
+                    f'future: prepared `{column_name}` as {target_type} {null_sql}',
+                    flush=True,
+                )
+
+        oi_rows = pd.read_sql_query(
+            text(
+                'SELECT `trade_date`, SUM(`open_interest`) AS open_interest '
+                'FROM `limitup_derivative_daily` '
+                'WHERE `trade_date`>=:start_date AND `product_code`=:product_code '
+                'GROUP BY `trade_date`'
+            ),
+            eng,
+            params={'start_date': start_day, 'product_code': 'KRDRVFUK2I'},
+        )
+        oi_by_date = {
+            pd.Timestamp(item['trade_date']).date(): int(item['open_interest'])
+            for _, item in oi_rows.iterrows()
+            if pd.notna(item['open_interest'])
+        }
+        investor_rows = pd.read_sql_query(
+            text(
+                'SELECT `trade_date`, `personal_net_flow`, `foreign_net_flow`, `institutional_net_flow` '
+                'FROM `limitup_futures_investor_daily` '
+                'WHERE `trade_date`>=:start_date AND `index_code`=:index_code'
+            ),
+            eng,
+            params={'start_date': start_day, 'index_code': 'FUT'},
+        )
+        investor_by_date = {
+            pd.Timestamp(item['trade_date']).date(): item
+            for _, item in investor_rows.iterrows()
+        }
+
+        existing = pd.read_sql_query(
+            text('SELECT `Date` FROM `future` WHERE `Date`>=:start_date'),
+            eng,
+            params={'start_date': start_day},
+        )
+        existing_days = {
+            pd.Timestamp(value).date()
+            for value in existing['Date'].dropna().tolist()
+        }
+        price_updates = []
+        new_rows = []
+        for _, item in prices.iterrows():
+            trade_day = item['trade_date']
+            investor = investor_by_date.get(trade_day)
+            personal = None if investor is None or pd.isna(investor['personal_net_flow']) else float(investor['personal_net_flow'])
+            foreign = None if investor is None or pd.isna(investor['foreign_net_flow']) else float(investor['foreign_net_flow'])
+            institution = None if investor is None or pd.isna(investor['institutional_net_flow']) else float(investor['institutional_net_flow'])
+            oi = oi_by_date.get(trade_day)
+            if trade_day in existing_days:
+                price_updates.append({'trade_date': trade_day, 'future_price': float(item['close_price'])})
+            else:
+                new_rows.append({
+                    'trade_date': trade_day,
+                    'future_price': float(item['close_price']),
+                    'open_interest': oi,
+                    'foreign_flow': foreign,
+                    'institution_flow': institution,
+                    'personal_flow': personal,
+                })
+
+        with eng.begin() as transaction:
+            if price_updates:
+                transaction.execute(
+                    text('UPDATE `future` SET `Future`=:future_price WHERE `Date`=:trade_date'),
+                    price_updates,
+                )
+            if new_rows:
+                transaction.execute(
+                    text(
+                        'INSERT INTO `future` '
+                        '(`Date`, `Future`, `미결제약정`, `외국인`, `기관`, `개인`) '
+                        'VALUES (:trade_date, :future_price, :open_interest, '
+                        ':foreign_flow, :institution_flow, :personal_flow)'
+                    ),
+                    new_rows,
+                )
+
+            # Refresh source-backed OI/flow values where available, without
+            # erasing any historical values when a source has no record.
+            if oi_by_date:
+                transaction.execute(
+                    text(
+                        'UPDATE `future` SET `미결제약정`=:open_interest '
+                        'WHERE `Date`=:trade_date'
+                    ),
+                    [
+                        {'trade_date': day, 'open_interest': value}
+                        for day, value in oi_by_date.items()
+                    ],
+                )
+            if investor_by_date:
+                transaction.execute(
+                    text(
+                        'UPDATE `future` SET `개인`=:personal_flow, `외국인`=:foreign_flow, `기관`=:institution_flow '
+                        'WHERE `Date`=:trade_date'
+                    ),
+                    [
+                        {
+                            'trade_date': day,
+                            'personal_flow': None if pd.isna(value['personal_net_flow']) else float(value['personal_net_flow']),
+                            'foreign_flow': None if pd.isna(value['foreign_net_flow']) else float(value['foreign_net_flow']),
+                            'institution_flow': None if pd.isna(value['institutional_net_flow']) else float(value['institutional_net_flow']),
+                        }
+                        for day, value in investor_by_date.items()
+                    ],
+                )
+
+        return {
+            'rows': int(len(prices)),
+            'inserted_dates': int(len(new_rows)),
+            'price_refreshed_dates': int(len(price_updates)),
+            'open_interest_dates': int(len(oi_by_date)),
+            'investor_flow_dates': int(len(investor_by_date)),
+            'from': prices['trade_date'].min().isoformat(),
+            'to': prices['trade_date'].max().isoformat(),
+            'status': 'upserted',
+            'note': 'Historical Naver FUT prices are backfilled; unavailable investor/OI history remains NULL.',
+        }
+
+    def update_macro_sources(self, start_date='2015-06-15', chunk_days=180, page_size=100):
+        """Incrementally update market-wide investor, deposit/credit and KPI200 data.
+
+        Investor flows and KPI200 use PyKRX. Customer deposits, credit balances and
+        fund balances use Naver's current JSON endpoint. The retired Naver HTML
+        investor/program pages are not scraped; programtrend remains explicitly
+        marked unavailable until a verified current KRX response mapping is added.
+        """
+        eng = _require_engine()
+        market_max = pd.read_sql_query(
+            text('SELECT MAX(`Date`) AS max_date FROM `market`'), eng
+        ).iloc[0]['max_date']
+        if market_max is None or pd.isna(market_max):
+            raise RuntimeError('market table has no latest date.')
+        end_day = pd.Timestamp(market_max).date()
+        results = {}
+
+        # KRX net trading value by investor for KOSPI + KOSDAQ, stored in 억원
+        # to retain the unit convention used by the legacy investortrend table.
+        try:
+            latest = pd.read_sql_query(
+                text('SELECT MAX(`Date`) AS max_date FROM `investortrend`'), eng
+            ).iloc[0]['max_date']
+            begin_day = (
+                pd.Timestamp(latest).date() + dt.timedelta(days=1)
+                if latest is not None and not pd.isna(latest)
+                else pd.Timestamp(start_date).date()
+            )
+            inserted = 0
+            if begin_day <= end_day and stock is not None:
+                chunk_start = begin_day
+                while chunk_start <= end_day:
+                    chunk_end = min(chunk_start + dt.timedelta(days=chunk_days - 1), end_day)
+                    print(f'investortrend: querying {chunk_start} ~ {chunk_end}', flush=True)
+                    market_frames = []
+                    for market_name in ('KOSPI', 'KOSDAQ'):
+                        raw = stock.get_market_trading_value_by_date(
+                            chunk_start.strftime('%Y%m%d'), chunk_end.strftime('%Y%m%d'),
+                            market_name, on='순매수',
+                        )
+                        if raw is None or raw.empty:
+                            continue
+                        raw = raw.copy()
+                        raw.columns = [str(column).strip() for column in raw.columns]
+                        required = {'개인', '외국인합계', '기관합계'}
+                        missing = required - set(raw.columns)
+                        if missing:
+                            raise ValueError(f'{market_name} investor columns missing: {sorted(missing)}')
+                        raw.index = pd.to_datetime(raw.index, errors='coerce').date
+                        raw.index.name = 'Date'
+                        part = raw[['개인', '외국인합계', '기관합계']].rename(
+                            columns={'외국인합계': '외국인', '기관합계': '기관'}
+                        )
+                        part = part.apply(pd.to_numeric, errors='coerce') / 100_000_000.0
+                        market_frames.append(part)
+                        time.sleep(0.15)
+                    if market_frames:
+                        daily = pd.concat(market_frames).groupby(level=0).sum(min_count=1).reset_index()
+                        daily = daily[['Date', '개인', '외국인', '기관']]
+                        daily = daily[daily['Date'] >= begin_day].drop_duplicates('Date').sort_values('Date')
+                        for column in ('개인', '외국인', '기관'):
+                            daily[column] = daily[column].round().fillna(0).astype('int64')
+                        if not daily.empty:
+                            with eng.begin() as transaction:
+                                daily.to_sql('investortrend', con=transaction, if_exists='append',
+                                             index=False, chunksize=1000)
+                            inserted += len(daily)
+                    chunk_start = chunk_end + dt.timedelta(days=1)
+            results['investortrend'] = {
+                'rows': inserted,
+                'status': 'inserted' if inserted else 'already_current_or_no_data',
+                'unit': 'KRW 100 million',
+            }
+        except Exception as exc:
+            logger.warning('PyKRX investor-flow update failed: %s', exc)
+            results['investortrend'] = {'rows': 0, 'status': 'failed', 'error': str(exc)[:200]}
+
+        # Current Naver Stock JSON endpoint (the old finance.naver HTML page is HTTP 410).
+        try:
+            latest = pd.read_sql_query(
+                text('SELECT MAX(`Date`) AS max_date FROM `moneytrend`'), eng
+            ).iloc[0]['max_date']
+            latest_day = pd.Timestamp(latest).date() if latest is not None and not pd.isna(latest) else None
+            floor_day = latest_day + dt.timedelta(days=1) if latest_day else pd.Timestamp(start_date).date()
+            url = 'https://stock.naver.com/api/domestic/market/trendDeposit'
+            headers = {
+                'User-Agent': _browser_user_agent(),
+                'Referer': 'https://stock.naver.com/market/stock/kr/deposit',
+                'Accept': 'application/json, text/plain, */*',
+            }
+            records = []
+            page_number = 0
+            total_pages = None
+            for _page in range(200):
+                print(f'moneytrend: fetching Naver page startIdx={page_number}', flush=True)
+                response = requests.get(
+                    url, params={'startIdx': page_number, 'pageSize': page_size},
+                    headers=headers, timeout=20,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                content = payload.get('content', []) if isinstance(payload, dict) else []
+                if not content:
+                    break
+                try:
+                    total_pages = int(payload.get('totalPages') or 0) or total_pages
+                except (TypeError, ValueError):
+                    pass
+                for item in content:
+                    day = datetime.strptime(str(item['bizdate']), '%Y%m%d').date()
+                    records.append({
+                        'Date': day,
+                        '고객예탁금': item.get('customerDeposit'),
+                        '신용잔고': item.get('creditLoan'),
+                        '주식형펀드': item.get('beneficiaryCertificateStock'),
+                        '혼합형펀드': item.get('beneficiaryCertificateMixing'),
+                        '채권형펀드': item.get('beneficiaryCertificateBond'),
+                    })
+                if len(content) < page_size:
+                    break
+                if total_pages and page_number + 1 >= total_pages:
+                    break
+                page_number += 1
+                time.sleep(0.15)
+            money = pd.DataFrame.from_records(records)
+            if not money.empty:
+                for column in ('고객예탁금', '신용잔고', '주식형펀드', '혼합형펀드', '채권형펀드'):
+                    money[column] = pd.to_numeric(money[column], errors='coerce').round().astype('Int64')
+                money = money.drop_duplicates('Date', keep='last').sort_values('Date')
+                existing_days = pd.read_sql_query(
+                    text('SELECT `Date` FROM `moneytrend`'), eng)
+                if not existing_days.empty:
+                    known = set(pd.to_datetime(existing_days['Date']).dt.date.tolist())
+                    money = money[~money['Date'].isin(known)]
+                inserted = 0
+                if not money.empty:
+                    with eng.begin() as transaction:
+                        money.to_sql('moneytrend', con=transaction, if_exists='append',
+                                     index=False, chunksize=1000)
+                    inserted = int(len(money))
+            else:
+                inserted = 0
+            results['moneytrend'] = {
+                'rows': inserted,
+                'status': 'inserted' if inserted else 'already_current',
+            }
+        except Exception as exc:
+            logger.warning('Naver deposit/credit JSON update failed: %s', exc)
+            results['moneytrend'] = {'rows': 0, 'status': 'failed', 'error': str(exc)[:200]}
+
+        # KOSPI200 index series from the KRX index code 1028.
+        try:
+            # Legacy schemas commonly used DECIMAL(5,2), which overflows once
+            # KOSPI200 moves above 999.99. Widen only a constrained numeric
+            # column, preserving its current NULL/NOT NULL setting.
+            column_info = pd.read_sql_query(
+                text("SHOW COLUMNS FROM `kpi200` LIKE 'kpi200'"), eng
+            )
+            if column_info.empty:
+                raise RuntimeError('kpi200.kpi200 column was not found.')
+            column = column_info.iloc[0]
+            current_type = str(column['Type']).lower()
+            print(f'kpi200: current DB column type is {current_type}', flush=True)
+            decimal_match = re.search(r'(?:decimal|numeric)\((\d+)\s*,\s*(\d+)\)', current_type)
+            needs_widening = decimal_match is None
+            if decimal_match:
+                precision, scale = map(int, decimal_match.groups())
+                needs_widening = precision - scale < 4 or scale < 2
+            if needs_widening:
+                null_sql = 'NULL' if str(column['Null']).upper() == 'YES' else 'NOT NULL'
+                with eng.begin() as transaction:
+                    transaction.execute(text(
+                        f'ALTER TABLE `kpi200` MODIFY COLUMN `kpi200` DECIMAL(12,2) {null_sql}'
+                    ))
+                print('kpi200: widened column to DECIMAL(12,2)', flush=True)
+            latest = pd.read_sql_query(
+                text('SELECT MAX(`Date`) AS max_date FROM `kpi200`'), eng
+            ).iloc[0]['max_date']
+            begin_day = (
+                pd.Timestamp(latest).date() + dt.timedelta(days=1)
+                if latest is not None and not pd.isna(latest)
+                else pd.Timestamp(start_date).date()
+            )
+            if begin_day > end_day:
+                results['kpi200'] = {'rows': 0, 'status': 'already_current'}
+            elif get_index_ohlcv_by_date is None:
+                results['kpi200'] = {'rows': 0, 'status': 'pykrx_unavailable'}
+            else:
+                print(f'kpi200: querying {begin_day} ~ {end_day}', flush=True)
+                raw = get_index_ohlcv_by_date(begin_day.strftime('%Y%m%d'), end_day.strftime('%Y%m%d'), '1028')
+                if raw is None or raw.empty:
+                    results['kpi200'] = {'rows': 0, 'status': 'no_data'}
+                else:
+                    raw = raw.copy()
+                    raw.columns = [str(column).strip() for column in raw.columns]
+                    close_col = next((c for c in raw.columns if c.lower() in ('종가', 'close')), None)
+                    volume_col = next((c for c in raw.columns if c.lower() in ('거래량', 'volume')), None)
+                    if close_col is None or volume_col is None:
+                        if raw.shape[1] < 5:
+                            raise ValueError(f'Unexpected KOSPI200 columns: {list(raw.columns)}')
+                        close_col, volume_col = raw.columns[3], raw.columns[4]
+                    frame = pd.DataFrame({
+                        'Date': pd.to_datetime(raw.index, errors='coerce').date,
+                        'kpi200': pd.to_numeric(raw[close_col], errors='coerce').to_numpy(),
+                        '거래량': pd.to_numeric(raw[volume_col], errors='coerce').to_numpy(),
+                    }).dropna(subset=['Date', 'kpi200', '거래량'])
+                    frame = frame[frame['Date'] >= begin_day].drop_duplicates('Date').sort_values('Date')
+                    if not frame.empty:
+                        frame['거래량'] = frame['거래량'].round().astype('int64')
+                        with eng.begin() as transaction:
+                            frame.to_sql('kpi200', con=transaction, if_exists='append', index=False, chunksize=1000)
+                    results['kpi200'] = {'rows': int(len(frame)), 'status': 'inserted' if not frame.empty else 'already_current'}
+        except Exception as exc:
+            logger.warning('PyKRX KOSPI200 update failed: %s', exc)
+            results['kpi200'] = {'rows': 0, 'status': 'failed', 'error': str(exc)[:200]}
+
+        try:
+            results['futures_index_daily'] = self.update_naver_futures_index_daily('FUT')
+        except Exception as exc:
+            logger.warning('Naver futures daily-price update failed: %s', exc)
+            results['futures_index_daily'] = {
+                'rows': 0, 'status': 'failed', 'error': str(exc)[:180],
+            }
+
+        try:
+            print('futures investor flow: backfilling Naver daily FUT trader data', flush=True)
+            results['futures_investor_daily'] = self.update_naver_futures_investor_daily('FUT')
+        except Exception as exc:
+            logger.warning('Naver futures investor summary update failed: %s', exc)
+            results['futures_investor_daily'] = {
+                'rows': 0, 'status': 'failed', 'error': str(exc)[:180],
+            }
+
+        # The old Naver program endpoint is retired; never relabel investor flows as program trades.
+        results['programtrend'] = {
+            'rows': 0,
+            'status': 'source_retired',
+            'detail': 'Naver legacy endpoint returns HTTP 410; no substitute values are fabricated.',
+        }
+        print('programtrend: skipped because the old Naver endpoint is retired (HTTP 410).', flush=True)
+
+        # Daum's hard-coded old contract endpoint returns HTTP 200 with no rows;
+        # don't call its legacy parser or imply that the stale aggregate table refreshed.
+        results['future'] = {
+            'status': 'source_unavailable',
+            'detail': 'Legacy Daum aggregate endpoint currently returns an empty dataset; contract OHLCV is collected separately.',
+        }
+        loader = to_excel()
+        try:
+            print('sectors: querying KOSPI/KOSDAQ sector snapshots', flush=True)
+            results['sectors'] = loader.sector()
+        except Exception as exc:
+            logger.warning('Sector snapshot update failed: %s', exc)
+            results['sectors'] = {'status': 'failed', 'error': str(exc)[:180]}
+        return results
+    def update_derivative_daily(self, end_date=None, sleep_sec=0.15):
+        """Store latest per-contract KRX futures/options OHLCV snapshot."""
+        if stock is None or not hasattr(stock, 'get_future_ticker_list'):
+            raise ImportError('Installed pykrx does not expose futures/options daily APIs.')
+        eng = _require_engine()
+        if end_date is None:
+            latest = pd.read_sql_query(
+                text('SELECT MAX(`Date`) AS max_date FROM `market`'), eng
+            ).iloc[0]['max_date']
+            if latest is None or pd.isna(latest):
+                raise RuntimeError('market table has no date to anchor the derivative snapshot.')
+            end_day = pd.Timestamp(latest).date()
+        else:
+            end_day = pd.Timestamp(end_date).date()
+        day_key = end_day.strftime('%Y%m%d')
+        products = stock.get_future_ticker_list()
+        records = []
+        failures = []
+
+        for product_index, product in enumerate(products, start=1):
+            product = str(product)
+            if product_index == 1 or product_index % 5 == 0:
+                print(f'derivatives: querying {product}', flush=True)
+            try:
+                if _KrxFutureQuotes is not None:
+                    raw = _KrxFutureQuotes().fetch(day_key, product)
+                    if raw is not None:
+                        if 'ISU_SRT_CD' in raw.columns:
+                            raw = raw.set_index('ISU_SRT_CD')
+                        raw = raw.rename(columns={
+                            'ISU_NM': 'contract_name',
+                            'TDD_CLSPRC': 'close_price',
+                            'CMPPREVDD_PRC': 'price_change',
+                            'TDD_OPNPRC': 'open_price',
+                            'TDD_HGPRC': 'high_price',
+                            'TDD_LWPRC': 'low_price',
+                            'SPOT_PRC': 'underlying_price',
+                            'ACC_TRDVOL': 'volume',
+                            'ACC_TRDVAL': 'trading_value',
+                            'ACC_OPNINT_QTY': 'open_interest',
+                        })
+                else:
+                    raw = stock.get_future_ohlcv_by_ticker(day_key, product)
+                if raw is None or raw.empty:
+                    continue
+                raw = raw.copy()
+                raw.index = pd.Index([str(code).strip() for code in raw.index], name='contract_code')
+                raw.columns = [str(column).strip() for column in raw.columns]
+                mapping = {
+                    '종목명': 'contract_name', '종가': 'close_price', '대비': 'price_change',
+                    '시가': 'open_price', '고가': 'high_price', '저가': 'low_price',
+                    '현물가': 'underlying_price', '거래량': 'volume', '거래대금': 'trading_value',
+                    '미결제약정': 'open_interest', '미결제약정수량': 'open_interest',
+                }
+                raw = raw.rename(columns=mapping)
+                required = ['contract_name', 'close_price', 'price_change', 'open_price',
+                            'high_price', 'low_price', 'underlying_price', 'volume', 'trading_value']
+                if not set(required).issubset(raw.columns):
+                    failures.append((product, 'unexpected columns'))
+                    continue
+                for numeric_column in (
+                    'open_price', 'high_price', 'low_price', 'close_price', 'price_change',
+                    'underlying_price', 'volume', 'trading_value', 'open_interest',
+                ):
+                    if numeric_column in raw.columns:
+                        raw[numeric_column] = pd.to_numeric(
+                            raw[numeric_column].astype(str).str.replace(',', '', regex=False),
+                            errors='coerce',
+                        )
+                kind = 'OPTION' if 'OP' in product.upper() else 'FUTURE'
+                for contract_code, row in raw.iterrows():
+                    records.append({
+                        'trade_date': end_day,
+                        'instrument_type': kind,
+                        'product_code': product,
+                        'contract_code': contract_code,
+                        'contract_name': row['contract_name'],
+                        'expiry_date': None,
+                        'option_type': None,
+                        'strike_price': None,
+                        'open_price': pd.to_numeric(row['open_price'], errors='coerce'),
+                        'high_price': pd.to_numeric(row['high_price'], errors='coerce'),
+                        'low_price': pd.to_numeric(row['low_price'], errors='coerce'),
+                        'close_price': pd.to_numeric(row['close_price'], errors='coerce'),
+                        'price_change': pd.to_numeric(row['price_change'], errors='coerce'),
+                        'underlying_price': pd.to_numeric(row['underlying_price'], errors='coerce'),
+                        'volume': pd.to_numeric(row['volume'], errors='coerce'),
+                        'trading_value': pd.to_numeric(row['trading_value'], errors='coerce'),
+                        'open_interest': (
+                            int(row['open_interest'])
+                            if 'open_interest' in row.index and pd.notna(row['open_interest'])
+                            else None
+                        ),
+                        'foreign_net_position': None,
+                        'institution_net_position': None,
+                        'individual_net_position': None,
+                        'source': 'pykrx',
+                    })
+            except Exception as exc:
+                failures.append((product, str(exc)[:160]))
+            time.sleep(sleep_sec)
+
+        if not records:
+            return {'date': end_day.isoformat(), 'rows': 0, 'status': 'no_data', 'failures': failures}
+        frame = pd.DataFrame.from_records(records).drop_duplicates(
+            subset=['trade_date', 'product_code', 'contract_code'], keep='last'
+        )
+        expected_primary_key = ['trade_date', 'product_code', 'contract_code']
+        existing_primary_key = pd.read_sql_query(
+            text(
+                "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='limitup_derivative_daily' "
+                "AND CONSTRAINT_NAME='PRIMARY' ORDER BY ORDINAL_POSITION"
+            ),
+            eng,
+        )['COLUMN_NAME'].tolist()
+        if existing_primary_key == ['trade_date', 'contract_code']:
+            # A contract code can recur under different PyKRX product tickers.
+            # Widen the namespaced table's key to keep those rows distinct.
+            with eng.begin() as transaction:
+                transaction.execute(text(
+                    'ALTER TABLE `limitup_derivative_daily` '
+                    'DROP PRIMARY KEY, '
+                    'ADD PRIMARY KEY (`trade_date`, `product_code`, `contract_code`)'
+                ))
+        elif existing_primary_key != expected_primary_key:
+            raise RuntimeError(
+                'Unexpected limitup_derivative_daily primary key: '
+                f'{existing_primary_key}; expected {expected_primary_key}'
+            )
+        with eng.begin() as transaction:
+            for product_code in frame['product_code'].drop_duplicates().tolist():
+                transaction.execute(
+                    text('DELETE FROM `limitup_derivative_daily` WHERE `trade_date`=:trade_date AND `product_code`=:product_code'),
+                    {'trade_date': end_day, 'product_code': product_code},
+                )
+            frame.to_sql('limitup_derivative_daily', con=transaction, if_exists='append',
+                         index=False, chunksize=2000)
+        return {
+            'date': end_day.isoformat(), 'rows': int(len(frame)),
+            'futures': int((frame['instrument_type'] == 'FUTURE').sum()),
+            'options': int((frame['instrument_type'] == 'OPTION').sum()),
+            'status': 'inserted', 'failures': failures,
+        }
 
 
 class to_excel:
@@ -2148,24 +3015,24 @@ class to_excel:
         path = str(STOCKDATA_DIR.parent / 'future.xlsx')
         if choice ==1:
             # Fake Header 정보
-            ua = UserAgent()
+            user_agent = _browser_user_agent()
 
             # 헤더 선언
             headers = {
-                'User-Agent': ua.ie,
+                'User-Agent': user_agent,
                 'referer': 'http://finance.daum.net/domestic/futures'
             }
 
             url = self.future_url +'1'
             #url = "http://finance.daum.net/api/future/KR4101PC0002/days?pagination=true&page=1"
-            res = req.urlopen(req.Request(url, headers=headers)).read().decode('utf-8')
+            res = req.urlopen(req.Request(url, headers=headers), timeout=30).read().decode('utf-8')
 
             df1 = pd.DataFrame()
             for i in range(1,7):
                 # 다음 주식 요청 URL
                 url = "http://finance.daum.net/api/future/KR4101Q30005/days?pagination=true&page="+str(i)
 
-                res = req.urlopen(req.Request(url, headers=headers)).read().decode('utf-8')
+                res = req.urlopen(req.Request(url, headers=headers), timeout=30).read().decode('utf-8')
 
                 rank_json = json.loads(res)['data']
 
@@ -2193,24 +3060,24 @@ class to_excel:
             until_date = datetime.strptime(until_date, '%Y-%m-%d').date() ## str 을  datetime.date로 type 변경
 
             # Fake Header 정보
-            ua = UserAgent()
+            user_agent = _browser_user_agent()
 
             # 헤더 선언
             headers = {
-                'User-Agent': ua.ie,
+                'User-Agent': user_agent,
                 'referer': 'http://finance.daum.net/domestic/futures'
             }
 
 
             url = "http://finance.daum.net/api/future/KR4101Q30005/days?pagination=true&page=1"  #KR4011PC002 "선물 코스피 200지수 12월물" 코드는 구글검색이용
-            res = req.urlopen(req.Request(url, headers=headers)).read().decode('utf-8')
+            res = req.urlopen(req.Request(url, headers=headers), timeout=30).read().decode('utf-8')
 
             df1 = pd.DataFrame()
             for i in range(1,3):
                 # 다음 주식 요청 URL
                 url = "http://finance.daum.net/api/future/KR4101Q30005/days?pagination=true&page="+str(i)
 
-                res = req.urlopen(req.Request(url, headers=headers)).read().decode('utf-8')
+                res = req.urlopen(req.Request(url, headers=headers), timeout=30).read().decode('utf-8')
 
                 rank_json = json.loads(res)['data']
 
@@ -2231,11 +3098,11 @@ class to_excel:
     def sector(self):
         
         # Fake Header 정보
-        ua = UserAgent()
+        user_agent = _browser_user_agent()
         
         # 헤더 선언
         headers = {
-            'User-Agent': ua['google chrome'],
+            'User-Agent': user_agent,
             'referer': 'http://finance.daum.net/domestic/all_stocks'
         }        
         
@@ -2243,9 +3110,13 @@ class to_excel:
         kosdaq_sector_url=self.kosdaq_sector_url
         
         # 요청
-        kospi_sector_res = req.urlopen(req.Request(kospi_sector_url, headers=headers)).read().decode('utf-8')
+        kospi_sector_res = req.urlopen(
+            req.Request(kospi_sector_url, headers=headers), timeout=30
+        ).read().decode('utf-8')
         try:
-            kosdaq_sector_res = req.urlopen(req.Request(kosdaq_sector_url, headers=headers)).read().decode('utf-8')
+            kosdaq_sector_res = req.urlopen(
+                req.Request(kosdaq_sector_url, headers=headers), timeout=30
+            ).read().decode('utf-8')
         except urllib.error.HTTPError as e:
             print(f"HTTP Error {e.code}: {e.reason}")
             print(f"Error content: {e.read().decode('utf-8')}")
@@ -2316,11 +3187,34 @@ class to_excel:
         kosdaq_sector = kosdaq.set_index('date')
         kospi_df =  kospi_sector.sort_values(["changeRate"],ascending=False)
         kosdaq_df =  kosdaq_sector.sort_values(["changeRate"],ascending=False)
-        
+
+        # Refresh only the dates returned by the sector endpoint; remove that
+        # date first to make rerunning the snapshot idempotent.
+        sector_results = {}
+        eng = _require_engine()
+        for table_name, source_frame in (('kospi_sector', kospi_df), ('kosdaq_sector', kosdaq_df)):
+            db_frame = source_frame.reset_index().rename(columns={'date': 'Date'})
+            db_frame['Date'] = pd.to_datetime(db_frame['Date'], errors='coerce').dt.date
+            db_frame = db_frame[['Date', 'sectorName', 'changeRate', 'first', 'second']]
+            db_frame = db_frame.dropna(subset=['Date', 'sectorName']).drop_duplicates(
+                subset=['Date', 'sectorName'], keep='last'
+            )
+            with eng.begin() as transaction:
+                for snapshot_date in db_frame['Date'].drop_duplicates():
+                    transaction.execute(
+                        text(f'DELETE FROM `{table_name}` WHERE `Date`=:date'),
+                        {'date': snapshot_date},
+                    )
+                if not db_frame.empty:
+                    db_frame.to_sql(table_name, con=transaction, if_exists='append',
+                                    index=False, chunksize=1000)
+            sector_results[table_name] = int(len(db_frame))
+
         kospi_df.to_excel(str(STOCKDATA_DIR.parent / 'kospi_sector.xlsx'))
         kosdaq_df.to_excel(str(STOCKDATA_DIR.parent / 'kosdaq_sector.xlsx'))   
         #kospi_df.to_sql(name='kospi_sector', con=engine, if_exists='append')
         #kosdaq_df.to_sql(name='kosdaq_seotor', con=engine, if_exists='append')
+        return sector_results
         
 
     def kospi_kosdaq(self):
